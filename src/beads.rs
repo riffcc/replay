@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::path::Path;
 use std::process::Command;
 
 /// A Beads issue as returned by `bd show --json`.
@@ -21,9 +22,10 @@ pub struct Issue {
 }
 
 /// Fetch the next ready issue from Beads.
-pub fn next_ready() -> Result<Option<Issue>> {
+pub fn next_ready(target: &Path) -> Result<Option<Issue>> {
     let output = Command::new("bd")
         .args(["ready", "--json"])
+        .current_dir(target)
         .output()
         .context("failed to run `bd ready`")?;
 
@@ -40,9 +42,10 @@ pub fn next_ready() -> Result<Option<Issue>> {
 }
 
 /// Fetch full details for a specific issue.
-pub fn show(id: &str) -> Result<Issue> {
+pub fn show(target: &Path, id: &str) -> Result<Issue> {
     let output = Command::new("bd")
         .args(["show", id, "--json"])
+        .current_dir(target)
         .output()
         .with_context(|| format!("failed to run `bd show {id}`"))?;
 
@@ -59,9 +62,10 @@ pub fn show(id: &str) -> Result<Issue> {
 }
 
 /// Claim an issue (atomically set assignee + in_progress).
-pub fn claim(id: &str) -> Result<()> {
+pub fn claim(target: &Path, id: &str) -> Result<()> {
     let output = Command::new("bd")
         .args(["update", id, "--claim"])
+        .current_dir(target)
         .output()
         .with_context(|| format!("failed to run `bd update {id} --claim`"))?;
 
@@ -74,9 +78,10 @@ pub fn claim(id: &str) -> Result<()> {
 }
 
 /// Close a completed issue.
-pub fn close(id: &str, reason: &str) -> Result<()> {
+pub fn close(target: &Path, id: &str, reason: &str) -> Result<()> {
     let output = Command::new("bd")
         .args(["close", id, "--reason", reason])
+        .current_dir(target)
         .output()
         .with_context(|| format!("failed to run `bd close {id}`"))?;
 
@@ -89,7 +94,12 @@ pub fn close(id: &str, reason: &str) -> Result<()> {
 }
 
 /// Create a follow-up issue linked to a parent.
-pub fn create_followup(title: &str, description: &str, discovered_from: &str) -> Result<String> {
+pub fn create_followup(
+    target: &Path,
+    title: &str,
+    description: &str,
+    discovered_from: &str,
+) -> Result<String> {
     let output = Command::new("bd")
         .args([
             "create",
@@ -99,6 +109,7 @@ pub fn create_followup(title: &str, description: &str, discovered_from: &str) ->
             "--dep", &format!("discovered-from:{discovered_from}"),
             "--json",
         ])
+        .current_dir(target)
         .output()
         .context("failed to run `bd create`")?;
 

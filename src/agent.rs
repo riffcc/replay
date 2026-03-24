@@ -18,11 +18,15 @@ use crate::beads::Issue;
 const MODEL: &str = "MiniMax-M2.7-Highspeed";
 
 /// Build the system prompt for a given issue.
-fn system_prompt(issue: &Issue) -> String {
+fn system_prompt(issue: &Issue, project_root: &Path) -> String {
+    let root_str = project_root.to_string_lossy();
     format!(
         r#"You are Replay, a self-improving software agent.
 
 Your task is to solve the following issue by reading the codebase and making changes.
+
+## Working Directory
+- **Project Root:** {root_str}
 
 ## Issue
 - **ID:** {id}
@@ -42,6 +46,7 @@ Your task is to solve the following issue by reading the codebase and making cha
 
 ## When you are done
 Respond with a brief summary of what you changed and why."#,
+        root_str = root_str,
         id = issue.id,
         title = issue.title,
         issue_type = issue.issue_type,
@@ -110,7 +115,7 @@ pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
         model: MODEL.into(),
         max_tokens: 8192,
         messages: vec![MessageParam::user("Solve this issue.")],
-        system: Some(SystemPrompt::Text(system_prompt(issue))),
+        system: Some(SystemPrompt::Text(system_prompt(issue, project_root))),
         ..Default::default()
     };
 
