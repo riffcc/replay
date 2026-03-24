@@ -52,3 +52,11 @@
 # - linear.api-key
 # - github.org
 # - github.repo
+sync:
+  export_on: push       # push | change
+  import_on: pull       # pull | change
+
+# Optional: Dolt federation
+federation:
+  remote: dolthub://wings/replay
+  sovereignty: T2
