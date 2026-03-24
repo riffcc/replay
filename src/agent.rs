@@ -2,15 +2,15 @@
 
 use anyhow::{Context, Result};
 use llm_code_sdk::{
-    ApiFormat, Client, MessageCreateParams, MessageParam, SystemPrompt,
-    Tool, ToolRunner, ToolRunnerConfig,
+    ActivateSkillTool, ApiFormat, Client, MessageCreateParams, MessageParam, SkillRegistry,
+    SkillResourceTool, SystemPrompt, Tool, ToolRunner, ToolRunnerConfig,
 };
 use llm_code_sdk::tools::{
-    BashTool, GlobTool, GrepTool, ListDirectoryTool, ToolEvent, ToolEventCallback,
+    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, ToolEvent, ToolEventCallback,
 };
 use llm_code_sdk::tools::smart::{SmartReadTool, SmartWriteTool};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::beads::Issue;
 
@@ -60,19 +60,53 @@ Respond with a brief summary of what you changed and why."#,
 }
 
 /// Create the tool set for the agent.
-fn create_tools(project_root: &Path) -> Vec<Arc<dyn Tool>> {
-    vec![
+fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>) -> Vec<Arc<dyn Tool>> {
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SmartReadTool::new(project_root)),
         Arc::new(SmartWriteTool::new(project_root)),
         Arc::new(BashTool::new(project_root)),
         Arc::new(GlobTool::new(project_root)),
         Arc::new(GrepTool::new(project_root)),
         Arc::new(ListDirectoryTool::new(project_root)),
-    ]
+        Arc::new(SearchTool::new(project_root)),
+    ];
+
+    // Only add skill tools if there are skills to activate
+    if !skill_registry.read().unwrap().is_empty() {
+        tools.push(Arc::new(ActivateSkillTool::new(Arc::clone(skill_registry))));
+        tools.push(Arc::new(SkillResourceTool::new(Arc::clone(skill_registry))));
+    }
+
+    tools
+}
+
+/// Discover agent skills and load AGENTS.md into the system prompt.
+fn build_system_prompt(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>) -> Option<String> {
+    let mut parts = Vec::new();
+
+    // AGENTS.md at project root — always included directly
+    let agents_md = project_root.join("AGENTS.md");
+    if agents_md.exists() {
+        if let Ok(content) = std::fs::read_to_string(&agents_md) {
+            parts.push(content);
+        }
+    }
+
+    // Skill catalog (names + descriptions only — progressive disclosure)
+    let catalog = skill_registry.read().unwrap().catalog_prompt();
+    if !catalog.is_empty() {
+        parts.push(catalog);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
 }
 
 /// Execute a freeform instruction. Returns the LLM's response.
-pub async fn execute(instruction: &str, project_root: &Path) -> Result<String> {
+pub async fn execute(instruction: &str, project_root: &Path, verbose: bool) -> Result<String> {
     let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
         .context("MINIMAX_AUTH_TOKEN must be set")?;
 
@@ -85,19 +119,39 @@ pub async fn execute(instruction: &str, project_root: &Path) -> Result<String> {
         .build()
         .context("failed to create LLM client")?;
 
-    let tools = create_tools(project_root);
+    // Discover agent skills: ~/.replay/skills/ first, then project-local .replay/skills/
+    let skill_registry = Arc::new(RwLock::new(SkillRegistry::new()));
+    {
+        let mut reg = skill_registry.write().unwrap();
+        let global_skills = dirs::home_dir()
+            .expect("no home directory")
+            .join(".replay")
+            .join("skills");
+        reg.discover(&global_skills);
 
-    let on_event: ToolEventCallback = Arc::new(|event| {
+        let local_skills = project_root.join(".replay").join("skills");
+        reg.discover(&local_skills);
+    }
+
+    let tools = create_tools(project_root, &skill_registry);
+
+    let on_event: ToolEventCallback = Arc::new(move |event| {
         match &event {
             ToolEvent::Text { text } => {
                 termimad::print_text(text);
             }
-            ToolEvent::ToolCall { name, .. } => {
+            ToolEvent::ToolCall { name, input } => {
                 println!("→ {name}");
+                if verbose {
+                    println!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default());
+                }
             }
-            ToolEvent::ToolResult { name, success, .. } => {
+            ToolEvent::ToolResult { name, success, output } => {
                 let icon = if *success { "✓" } else { "✗" };
                 println!("  {icon} {name}");
+                if verbose {
+                    println!("  output: {output}");
+                }
             }
         }
     });
@@ -111,10 +165,14 @@ pub async fn execute(instruction: &str, project_root: &Path) -> Result<String> {
 
     let runner = ToolRunner::with_config(client, tools, config);
 
+    let system = build_system_prompt(project_root, &skill_registry)
+        .map(SystemPrompt::Text);
+
     let params = MessageCreateParams {
         model: MODEL.into(),
         max_tokens: 8192,
         messages: vec![MessageParam::user(instruction)],
+        system,
         ..Default::default()
     };
 
@@ -141,7 +199,8 @@ pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
         .build()
         .context("failed to create LLM client")?;
 
-    let tools = create_tools(project_root);
+    let skill_registry = Arc::new(RwLock::new(SkillRegistry::new()));
+    let tools = create_tools(project_root, &skill_registry);
 
     let on_event: ToolEventCallback = Arc::new(|event| {
         match &event {
