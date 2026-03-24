@@ -116,6 +116,21 @@ impl DisplayState {
                 let line = format!("\u{1F4C2} List({DIM}{path}{RESET})");
                 self.print_pending(&line);
             }
+            "tasks" => {
+                self.flush();
+                let op = s("operation");
+                let id = s("id");
+                let title = s("title");
+                let detail = if !id.is_empty() {
+                    format!("{op} {id}")
+                } else if !title.is_empty() {
+                    format!("{op}: {title}")
+                } else {
+                    op
+                };
+                let line = format!("\u{1F4CB} Tasks({DIM}{detail}{RESET})");
+                self.print_pending(&line);
+            }
             "activate_skill" => {
                 // Skills get a one-line result on completion, no pending line
                 self.flush();
@@ -149,6 +164,23 @@ impl DisplayState {
                 if self.verbose {
                     println!();
                     println!("  output: {output}");
+                }
+            }
+            "tasks" => {
+                // Render task output as markdown for rich display
+                let bullet = if success {
+                    format!("{GREEN}●{RESET}")
+                } else {
+                    format!("{RED}●{RESET}")
+                };
+                if let Some(line) = self.pending_line.take() {
+                    let mut out = io::stdout();
+                    write!(out, "\r\x1b[2K{bullet} {line}").ok();
+                    out.flush().ok();
+                    println!();
+                }
+                if !output.is_empty() {
+                    termimad::print_text(output);
                 }
             }
             "activate_skill" => {

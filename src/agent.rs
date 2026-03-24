@@ -6,7 +6,7 @@ use llm_code_sdk::{
     SkillResourceTool, SystemPrompt, Tool, ToolRunner, ToolRunnerConfig,
 };
 use llm_code_sdk::tools::{
-    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, ToolEvent, ToolEventCallback,
+    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, TasksTool, ToolEvent, ToolEventCallback,
 };
 use llm_code_sdk::tools::smart::{SmartReadTool, SmartWriteTool};
 use std::path::Path;
@@ -69,6 +69,7 @@ fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>
         Arc::new(GrepTool::new(project_root)),
         Arc::new(ListDirectoryTool::new(project_root)),
         Arc::new(SearchTool::new(project_root)),
+        Arc::new(TasksTool::new(project_root)),
     ];
 
     // Only add skill tools if there are skills to activate
