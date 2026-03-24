@@ -71,6 +71,62 @@ fn create_tools(project_root: &Path) -> Vec<Arc<dyn Tool>> {
     ]
 }
 
+/// Execute a freeform instruction. Returns the LLM's response.
+pub async fn execute(instruction: &str, project_root: &Path) -> Result<String> {
+    let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
+        .context("MINIMAX_AUTH_TOKEN must be set")?;
+
+    let base_url = std::env::var("MINIMAX_BASE_URL")
+        .unwrap_or_else(|_| "https://api.minimax.io/anthropic".into());
+
+    let client = Client::builder(&api_key)
+        .base_url(&base_url)
+        .format(ApiFormat::Anthropic)
+        .build()
+        .context("failed to create LLM client")?;
+
+    let tools = create_tools(project_root);
+
+    let on_event: ToolEventCallback = Arc::new(|event| {
+        match &event {
+            ToolEvent::Text { text } => {
+                termimad::print_text(text);
+            }
+            ToolEvent::ToolCall { name, .. } => {
+                println!("→ {name}");
+            }
+            ToolEvent::ToolResult { name, success, .. } => {
+                let icon = if *success { "✓" } else { "✗" };
+                println!("  {icon} {name}");
+            }
+        }
+    });
+
+    let config = ToolRunnerConfig {
+        max_iterations: Some(50),
+        verbose: false,
+        on_event: Some(on_event),
+        ..Default::default()
+    };
+
+    let runner = ToolRunner::with_config(client, tools, config);
+
+    let params = MessageCreateParams {
+        model: MODEL.into(),
+        max_tokens: 8192,
+        messages: vec![MessageParam::user(instruction)],
+        ..Default::default()
+    };
+
+    let response = runner.run(params).await
+        .context("agent run failed")?;
+
+    response
+        .text()
+        .ok_or_else(|| anyhow::anyhow!("agent produced no text response"))
+        .map(|s| s.to_string())
+}
+
 /// Run the agent against a single issue. Returns the LLM's summary.
 pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
     let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
