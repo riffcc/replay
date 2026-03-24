@@ -33,8 +33,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     input: &mut InputManager,
 ) -> Result<()> {
-    // TODO: check if a project is already configured → Screen::home()
-    let mut screen = Screen::welcome();
+    let mut screen = Screen::initial();
 
     loop {
         terminal.draw(|frame| screen.render(frame))?;
