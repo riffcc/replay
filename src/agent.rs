@@ -105,8 +105,13 @@ fn build_system_prompt(project_root: &Path, skill_registry: &Arc<RwLock<SkillReg
     }
 }
 
-/// Execute a freeform instruction. Returns the LLM's response.
-pub async fn execute(instruction: &str, project_root: &Path, verbose: bool) -> Result<String> {
+/// Execute a freeform instruction with conversation history. Returns the LLM's response.
+pub async fn execute(
+    instruction: &str,
+    project_root: &Path,
+    on_event: ToolEventCallback,
+    history: &mut Vec<MessageParam>,
+) -> Result<String> {
     let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
         .context("MINIMAX_AUTH_TOKEN must be set")?;
 
@@ -135,27 +140,6 @@ pub async fn execute(instruction: &str, project_root: &Path, verbose: bool) -> R
 
     let tools = create_tools(project_root, &skill_registry);
 
-    let on_event: ToolEventCallback = Arc::new(move |event| {
-        match &event {
-            ToolEvent::Text { text } => {
-                termimad::print_text(text);
-            }
-            ToolEvent::ToolCall { name, input } => {
-                println!("→ {name}");
-                if verbose {
-                    println!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default());
-                }
-            }
-            ToolEvent::ToolResult { name, success, output } => {
-                let icon = if *success { "✓" } else { "✗" };
-                println!("  {icon} {name}");
-                if verbose {
-                    println!("  output: {output}");
-                }
-            }
-        }
-    });
-
     let config = ToolRunnerConfig {
         max_iterations: Some(50),
         verbose: false,
@@ -168,10 +152,12 @@ pub async fn execute(instruction: &str, project_root: &Path, verbose: bool) -> R
     let system = build_system_prompt(project_root, &skill_registry)
         .map(SystemPrompt::Text);
 
+    history.push(MessageParam::user(instruction));
+
     let params = MessageCreateParams {
         model: MODEL.into(),
         max_tokens: 8192,
-        messages: vec![MessageParam::user(instruction)],
+        messages: history.clone(),
         system,
         ..Default::default()
     };
@@ -179,10 +165,14 @@ pub async fn execute(instruction: &str, project_root: &Path, verbose: bool) -> R
     let response = runner.run(params).await
         .context("agent run failed")?;
 
-    response
+    let text = response
         .text()
-        .ok_or_else(|| anyhow::anyhow!("agent produced no text response"))
-        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("agent produced no text response"))?
+        .to_string();
+
+    history.push(MessageParam::assistant(&text));
+
+    Ok(text)
 }
 
 /// Run the agent against a single issue. Returns the LLM's summary.
