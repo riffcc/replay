@@ -55,6 +55,7 @@
 sync:
   export_on: push       # push | change
   import_on: pull       # pull | change
+  git-remote: https://doltremoteapi.dolthub.com/wings/replay
 
 # Optional: Dolt federation
 federation:
