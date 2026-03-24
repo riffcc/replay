@@ -1,78 +1,111 @@
 //! Screen system — each screen owns its menu and rendering.
 
+use std::path::PathBuf;
 use ratatui::prelude::*;
+use ratatui::widgets::Paragraph;
 
 use super::input::InputEvent;
 use super::menu::{Menu, MenuAction, MenuItem};
+use crate::beads;
 
 /// Which screen we're on.
 pub enum Screen {
-    /// First launch, no project configured.
+    /// Main menu — beads not yet loaded.
     Welcome(Menu),
-    /// Project exists, can continue.
-    Home(Menu),
-    /// Inside a session, no issues yet.
-    SessionEmpty(Menu),
+    /// Active session — viewing issues.
+    Session(SessionState),
+}
+
+pub struct SessionState {
+    pub target: PathBuf,
+    pub issues: Vec<beads::Issue>,
+    pub menu: Menu,
+    pub status: String,
 }
 
 /// What the app should do after a screen handles input.
 pub enum Transition {
-    /// Stay on this screen.
     Stay,
-    /// Switch to a different screen.
     Goto(Screen),
-    /// Quit the application.
     Quit,
 }
 
 impl Screen {
-    /// Create the welcome screen (no project configured).
-    pub fn welcome() -> Self {
-        Screen::Welcome(Menu::new(vec![
-            MenuItem::new("Start new session"),
-            MenuItem::new("Settings"),
-            MenuItem::new("Quit"),
-        ]))
+    /// Detect state and build the right initial screen.
+    pub fn initial() -> Self {
+        let cwd = std::env::current_dir().expect("failed to get cwd");
+        if beads::is_initialised(&cwd) {
+            Screen::start_session(cwd)
+        } else {
+            Screen::Welcome(Menu::new(vec![
+                MenuItem::new("Initialise project"),
+                MenuItem::new("Settings"),
+                MenuItem::new("Quit"),
+            ]))
+        }
     }
 
-    /// Create the home screen (project exists).
-    pub fn home() -> Self {
-        Screen::Home(Menu::new(vec![
-            MenuItem::new("Continue project"),
-            MenuItem::new("Start new session"),
-            MenuItem::new("Settings"),
-            MenuItem::new("Quit"),
-        ]))
+    /// Load (or reload) a session from a target directory.
+    fn start_session(target: PathBuf) -> Self {
+        if !beads::is_initialised(&target) {
+            if let Err(e) = beads::init(&target) {
+                return Screen::Welcome(Menu::new(vec![
+                    MenuItem::new(format!("Error: {e}")),
+                    MenuItem::new("Quit"),
+                ]));
+            }
+        }
+
+        let (issues, status) = match beads::list_all(&target) {
+            Ok(issues) => {
+                let count = issues.len();
+                (issues, format!("{count} issues"))
+            }
+            Err(e) => (Vec::new(), format!("error: {e}")),
+        };
+
+        let menu_items = if issues.is_empty() {
+            vec![MenuItem::new("Find next issues to work on")]
+        } else {
+            let mut items: Vec<MenuItem> = issues
+                .iter()
+                .map(|issue| {
+                    MenuItem::with_marker(
+                        &issue.title,
+                        status_icon(&issue.status),
+                    )
+                })
+                .collect();
+            items.push(MenuItem::new("Find next issues to work on"));
+            items
+        };
+
+        Screen::Session(SessionState {
+            target,
+            issues,
+            menu: Menu::new(menu_items),
+            status,
+        })
     }
 
-    /// Create the empty session screen.
-    pub fn session_empty() -> Self {
-        Screen::SessionEmpty(Menu::new(vec![
-            MenuItem::new("Find next issues to work on"),
-        ]))
-    }
-
-    /// Handle input. Returns what the app should do next.
+    /// Handle input.
     pub fn handle(&mut self, event: InputEvent) -> Transition {
         match self {
             Screen::Welcome(menu) => match menu.handle(event) {
-                MenuAction::Confirmed(0) => Transition::Goto(Screen::session_empty()),
-                MenuAction::Confirmed(2) => Transition::Quit,
-                _ => Transition::Stay,
-            },
-            Screen::Home(menu) => match menu.handle(event) {
-                MenuAction::Confirmed(0) => Transition::Goto(Screen::session_empty()),
-                MenuAction::Confirmed(1) => Transition::Goto(Screen::session_empty()),
-                MenuAction::Confirmed(3) => Transition::Quit,
-                _ => Transition::Stay,
-            },
-            Screen::SessionEmpty(menu) => {
-                if event == InputEvent::Back {
-                    return Transition::Goto(Screen::home());
+                MenuAction::Confirmed(0) => {
+                    let cwd = std::env::current_dir().expect("failed to get cwd");
+                    Transition::Goto(Screen::start_session(cwd))
                 }
-                match menu.handle(event) {
-                    MenuAction::Confirmed(0) => {
-                        // This is where we'll generate suggestions
+                MenuAction::Confirmed(i) if is_quit_index(i, menu) => Transition::Quit,
+                _ => Transition::Stay,
+            },
+            Screen::Session(state) => {
+                if event == InputEvent::Back {
+                    return Transition::Goto(Screen::initial());
+                }
+                match state.menu.handle(event) {
+                    MenuAction::Confirmed(_) => {
+                        // TODO: solve selected issue or generate suggestions
                         Transition::Stay
                     }
                     _ => Transition::Stay,
@@ -85,66 +118,94 @@ impl Screen {
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Left third of the screen
+        // Reserve bottom row for legend
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let legend = Paragraph::new(
+            "◌ Not started │ ◐ In progress │ ❄ Deferred │ ● Blocked │ ◍ Tests written │ ✪ Passing tests │ ⦿ Accepted │ ✔ Completed"
+        ).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(legend, pad_left(outer[1], 3));
+
         let h_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Percentage(33),
                 Constraint::Percentage(67),
             ])
-            .split(area);
+            .split(outer[0]);
 
         let left = h_layout[0];
 
-        // Vertically center the content
-        let menu_height = match self {
-            Screen::Welcome(m) => menu_render_height(3),
-            Screen::Home(m) => menu_render_height(4),
-            Screen::SessionEmpty(m) => menu_render_height(1),
+        let (title, menu, subtitle) = match self {
+            Screen::Welcome(menu) => ("Welcome to Replay.", menu, None),
+            Screen::Session(state) => ("Session", &state.menu, Some(state.status.as_str())),
         };
-        // title + blank line + menu
-        let content_height = 1 + 1 + menu_height;
+
+        let subtitle_height: u16 = if subtitle.is_some() { 2 } else { 0 };
+        // title + subtitle + gap + generous menu estimate
+        let menu_item_count = menu.item_count() as u16;
+        let menu_height = menu_render_height(menu_item_count);
+        let content_height = 1 + subtitle_height + 1 + menu_height;
         let v_pad = left.height.saturating_sub(content_height) / 2;
 
         let v_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(v_pad),
-                Constraint::Length(1),  // title
-                Constraint::Length(1),  // blank
-                Constraint::Length(menu_height),
-                Constraint::Min(0),
+                Constraint::Length(1),               // title
+                Constraint::Length(subtitle_height),  // subtitle
+                Constraint::Length(1),               // gap
+                Constraint::Min(0),                  // menu gets all remaining space
             ])
             .split(left);
 
-        let title = match self {
-            Screen::Welcome(_) => "Welcome to Replay.",
-            Screen::Home(_) => "Welcome back.",
-            Screen::SessionEmpty(_) => "Session",
-        };
+        let pad = 7;
+        let title_area = pad_left(v_layout[1], pad);
+        let subtitle_area = pad_left(v_layout[2], pad);
+        let menu_area = pad_left(v_layout[4], pad);  // index 4 = Min(0)
 
-        // Pad from left edge
-        let title_area = pad_left(v_layout[1], 7);
-        let menu_area = pad_left(v_layout[3], 7);
-
-        let title_widget = ratatui::widgets::Paragraph::new(title)
+        let title_widget = Paragraph::new(title)
             .style(Style::default().fg(Color::White).bold());
         frame.render_widget(title_widget, title_area);
 
-        match self {
-            Screen::Welcome(menu) => menu.render(frame, menu_area),
-            Screen::Home(menu) => menu.render(frame, menu_area),
-            Screen::SessionEmpty(menu) => menu.render(frame, menu_area),
+        if let Some(sub) = subtitle {
+            let sub_widget = Paragraph::new(sub)
+                .style(Style::default().fg(Color::Gray));
+            frame.render_widget(sub_widget, subtitle_area);
         }
+
+        menu.render(frame, menu_area);
     }
 }
 
-/// How many rows a menu with n items needs (items + blank lines between).
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "open" => "◌",
+        "in_progress" => "◐",
+        "deferred" => "❄",
+        "blocked" => "●",
+        "tests_written" => "◍",
+        "passing_tests" => "✪",
+        "accepted" => "⦿",
+        "closed" => "✔",
+        _ => "?",
+    }
+}
+
+fn is_quit_index(i: usize, menu: &Menu) -> bool {
+    i == menu.item_count() - 1
+}
+
 fn menu_render_height(item_count: u16) -> u16 {
     if item_count == 0 { 0 } else { item_count * 2 - 1 }
 }
 
-/// Shrink a rect by padding from the left.
 fn pad_left(area: Rect, pad: u16) -> Rect {
     if pad >= area.width {
         return area;
