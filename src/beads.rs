@@ -21,6 +21,47 @@ pub struct Issue {
     pub labels: Vec<String>,
 }
 
+/// Check if beads is initialised in the given directory.
+pub fn is_initialised(target: &Path) -> bool {
+    target.join(".beads").exists()
+}
+
+/// Initialise beads in the given directory.
+pub fn init(target: &Path) -> Result<()> {
+    let output = Command::new("bd")
+        .args(["init"])
+        .current_dir(target)
+        .output()
+        .context("failed to run `bd init`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("`bd init` failed: {stderr}");
+    }
+
+    Ok(())
+}
+
+/// Fetch all issues from Beads.
+pub fn list_all(target: &Path) -> Result<Vec<Issue>> {
+    let output = Command::new("bd")
+        .args(["list", "--json"])
+        .current_dir(target)
+        .output()
+        .context("failed to run `bd list`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("`bd list` failed: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let issues: Vec<Issue> = serde_json::from_str(&stdout)
+        .context("failed to parse `bd list` output")?;
+
+    Ok(issues)
+}
+
 /// Fetch the next ready issue from Beads.
 pub fn next_ready(target: &Path) -> Result<Option<Issue>> {
     let output = Command::new("bd")
