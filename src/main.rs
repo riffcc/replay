@@ -7,36 +7,48 @@ mod tui;
 
 pub const VERSION: &str = "0.1.0";
 
-use std::io::{self, BufRead, Write};
-
 use anyhow::Result;
+use rustyline::DefaultEditor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
+    let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
     let target = std::env::current_dir()?;
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+
+    let mut rl = DefaultEditor::new()?;
+    let replay_dir = dirs::home_dir()
+        .expect("no home directory")
+        .join(".replay");
+    std::fs::create_dir_all(&replay_dir)?;
+    let history_path = replay_dir.join("history");
+    let _ = rl.load_history(&history_path);
 
     loop {
-        write!(stdout, "\n\x1b[48;5;236m \u{203a} \x1b[0m ")?;
-        stdout.flush()?;
+        let prompt = "\n\x1b[48;5;236m \u{203a} \x1b[0m ";
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let instruction = line.trim();
+                if instruction.is_empty() {
+                    continue;
+                }
 
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break;
-        }
+                rl.add_history_entry(instruction)?;
+                println!();
 
-        println!();
-
-        let instruction = line.trim();
-        if instruction.is_empty() {
-            continue;
-        }
-
-        if let Err(e) = agent::execute(instruction, &target).await {
-            eprintln!("error: {e:#}");
+                if let Err(e) = agent::execute(instruction, &target, verbose).await {
+                    eprintln!("error: {e:#}");
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => {
+                let _ = rl.save_history(&history_path);
+                break;
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                break;
+            }
         }
     }
 
