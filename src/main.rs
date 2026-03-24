@@ -20,13 +20,15 @@ async fn main() -> Result<()> {
     let mut stdout = io::stdout();
 
     loop {
-        write!(stdout, "\u{203a} ")?;
+        write!(stdout, "\n\x1b[48;5;236m \u{203a} \x1b[0m ")?;
         stdout.flush()?;
 
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {
             break;
         }
+
+        println!();
 
         let instruction = line.trim();
         if instruction.is_empty() {
