@@ -3,6 +3,7 @@
 mod agent;
 mod app;
 mod beads;
+mod markdown;
 mod display;
 mod engine;
 mod session;
@@ -76,9 +77,16 @@ async fn main() -> Result<()> {
         if msg.role == "user" {
             s.push_output(format!("\u{203a} {text}"));
         } else {
-            s.push_output(text);
+            s.push_markdown(text);
         }
         s.push_output(String::new());
+    }
+
+    // Set initial state
+    {
+        let mut s = state.lock().unwrap();
+        s.project_path = target.to_string_lossy().to_string();
+        s.model_name = "MiniMax-M2.7".to_string();
     }
 
     // Run TUI on a dedicated thread (it blocks for rendering)
@@ -105,6 +113,53 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // Handle slash commands
+                if instruction.starts_with('/') {
+                    let mut s = state.lock().unwrap();
+                    match instruction.as_str() {
+                        "/usage always" | "/usage on" | "/usage display always" | "/usage display on" => {
+                            s.show_usage = true;
+                        }
+                        "/usage off" | "/usage display off" => {
+                            s.show_usage = false;
+                        }
+                        "/usage" => {
+                            s.show_usage = !s.show_usage;
+                        }
+                        "/model display always" | "/model display on" | "/model on" => {
+                            s.show_model = true;
+                        }
+                        "/model display off" | "/model off" => {
+                            s.show_model = false;
+                        }
+                        "/model" => {
+                            s.show_model = !s.show_model;
+                        }
+                        "/context display always" | "/context display on" | "/context on" => {
+                            s.show_context = true;
+                        }
+                        "/context display off" | "/context off" => {
+                            s.show_context = false;
+                        }
+                        "/context" => {
+                            s.show_context = !s.show_context;
+                        }
+                        "/project display always" | "/project display on" | "/project on" => {
+                            s.show_project = true;
+                        }
+                        "/project display off" | "/project off" => {
+                            s.show_project = false;
+                        }
+                        "/project" => {
+                            s.show_project = !s.show_project;
+                        }
+                        _ => {
+                            s.push_output(format!("Unknown command: {instruction}"));
+                        }
+                    }
+                    continue;
+                }
+
                 // Echo user input to output
                 {
                     let mut s = state.lock().unwrap();
@@ -122,38 +177,63 @@ async fn main() -> Result<()> {
                     match &event {
                         llm_code_sdk::tools::ToolEvent::Text { text } => {
                             s.throbber_state = 1;
-                            s.push_output(text.clone());
+                            s.push_markdown(text.clone());
                         }
                         llm_code_sdk::tools::ToolEvent::ToolCall { name, input } => {
                             s.throbber_state = 2;
-                            let detail = tool_summary(name, input);
-                            let emoji = tool_emoji(name);
-                            if detail.is_empty() {
-                                s.push_output(format!("{emoji} {name}"));
+                            // Survey tool is displayed as the interactive UI, not as a tool call line
+                            if name == "survey" {
+                                // The survey UI will appear via pending_survey in AppState
                             } else {
-                                s.push_output(format!("{emoji} {name}({detail})"));
-                            }
-                            if cb_verbose {
-                                s.push_output(format!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default()));
+                                let detail = tool_summary(name, input);
+                                let emoji = tool_emoji(name);
+                                if detail.is_empty() {
+                                    s.push_output(format!("{emoji} {name}"));
+                                } else {
+                                    s.push_output(format!("{emoji} {name}({detail})"));
+                                }
+                                if cb_verbose {
+                                    s.push_output(format!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default()));
+                                }
                             }
                         }
                         llm_code_sdk::tools::ToolEvent::ToolResult { name, success, output } => {
                             s.throbber_state = 1;
                             let icon = if *success { "\x1b[32m●\x1b[0m" } else { "\x1b[31m●\x1b[0m" };
-                            // For tasks, show the formatted output
+                            // For tasks, show the formatted output as markdown
                             if *name == "tasks" && !output.is_empty() {
-                                s.push_output(output.clone());
+                                s.push_markdown(output.clone());
                             }
                             if cb_verbose {
                                 s.push_output(format!("  {icon} {name} output: {output}"));
                             }
                         }
+                        llm_code_sdk::tools::ToolEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens } => {
+                            s.total_input_tokens += input_tokens;
+                            s.total_output_tokens += output_tokens;
+                            s.total_cache_read += cache_read_tokens;
+                            s.total_cache_creation += cache_creation_tokens;
+                        }
                     }
                 });
 
-                let survey_cb: llm_code_sdk::tools::SurveyCallback = Arc::new(|_req| {
-                    // TODO: wire survey through TUI
-                    llm_code_sdk::tools::SurveyResponse { selected: vec![] }
+                let survey_state = Arc::clone(&state);
+                let survey_cb: llm_code_sdk::tools::SurveyCallback = Arc::new(move |req| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    {
+                        let mut s = survey_state.lock().unwrap();
+                        let option_count = req.options.len();
+                        s.pending_survey = Some(app::PendingSurvey {
+                            prompt: req.prompt.clone(),
+                            options: req.options.clone(),
+                            multi: req.multi,
+                            cursor: 0,
+                            selected: vec![false; option_count],
+                            response_tx: tx,
+                        });
+                    }
+                    // Block until the TUI sends the response
+                    rx.recv().unwrap_or(llm_code_sdk::tools::SurveyResponse { selected: vec![] })
                 });
 
                 // Run agent

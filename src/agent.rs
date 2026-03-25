@@ -220,6 +220,7 @@ pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
                 let icon = if *success { "✓" } else { "✗" };
                 tracing::info!("  {icon} {name}");
             }
+            ToolEvent::Usage { .. } => {}
         }
     });
 

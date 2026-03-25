@@ -14,10 +14,13 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use tokio::sync::mpsc;
 
-/// A line in the output log. Stored pre-wrapped to terminal width.
+/// A line in the output log.
 #[derive(Clone)]
 pub struct OutputLine {
+    /// Plain text content (for re-wrapping).
     pub content: String,
+    /// Styled spans for rendering (optional — if None, render as raw).
+    pub styled: Option<Vec<Span<'static>>>,
 }
 
 /// Wrap a string to a given width, returning individual lines.
@@ -31,7 +34,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             lines.push(String::new());
             continue;
         }
-        // Simple char-based wrapping (ANSI-unaware for now)
         let chars: Vec<char> = raw_line.chars().collect();
         for chunk in chars.chunks(width.max(1)) {
             lines.push(chunk.iter().collect());
@@ -40,10 +42,85 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Wrap a styled Line to a given width, splitting spans across lines.
+fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+
+    let total_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    if total_width <= width {
+        return vec![line.clone()];
+    }
+
+    let mut result: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width: usize = 0;
+
+    for span in &line.spans {
+        let style = span.style;
+        let mut remaining: &str = &span.content;
+
+        while !remaining.is_empty() {
+            let available = width.saturating_sub(current_width);
+            if available == 0 {
+                result.push(Line::from(std::mem::take(&mut current_spans)));
+                current_width = 0;
+                continue;
+            }
+
+            let char_count = remaining.chars().count();
+            if char_count <= available {
+                current_spans.push(Span::styled(remaining.to_string(), style));
+                current_width += char_count;
+                break;
+            } else {
+                // Split at available chars
+                let split_at: usize = remaining.char_indices()
+                    .nth(available)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len());
+                let (take, rest) = remaining.split_at(split_at);
+                current_spans.push(Span::styled(take.to_string(), style));
+                result.push(Line::from(std::mem::take(&mut current_spans)));
+                current_width = 0;
+                remaining = rest;
+            }
+        }
+    }
+
+    if !current_spans.is_empty() {
+        result.push(Line::from(current_spans));
+    }
+
+    if result.is_empty() {
+        result.push(Line::raw(""));
+    }
+
+    result
+}
+
+/// A survey waiting for user input.
+pub struct PendingSurvey {
+    pub prompt: String,
+    pub options: Vec<llm_code_sdk::tools::SurveyOption>,
+    pub multi: bool,
+    pub cursor: usize,
+    pub selected: Vec<bool>,
+    pub response_tx: std::sync::mpsc::Sender<llm_code_sdk::tools::SurveyResponse>,
+}
+
+/// Raw entry for re-wrapping on resize.
+#[derive(Clone)]
+enum RawEntry {
+    Plain(String),
+    Markdown(String),
+}
+
 /// State shared between the TUI and the agent.
 pub struct AppState {
-    /// Raw output strings (not wrapped).
-    raw_output: Vec<String>,
+    /// Raw output entries (not wrapped).
+    raw_output: Vec<RawEntry>,
     /// Pre-wrapped output lines for display.
     pub output: Vec<OutputLine>,
     /// Current terminal width for wrapping.
@@ -58,6 +135,29 @@ pub struct AppState {
     pub throbber_frame: u8,
     /// Throbber state: 0=idle, 1=thinking, 2=tool
     pub throbber_state: u8,
+    /// Cumulative token usage for this session.
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read: u64,
+    pub total_cache_creation: u64,
+    /// Status bar visibility flags.
+    pub show_usage: bool,
+    pub show_model: bool,
+    pub show_context: bool,
+    pub show_project: bool,
+    /// Model name.
+    pub model_name: String,
+    /// Project directory path.
+    pub project_path: String,
+    /// Context window size (for percentage calculation).
+    pub context_window: u64,
+    /// Pending survey for the user to answer.
+    pub pending_survey: Option<PendingSurvey>,
+    /// Token rate tracking for animation.
+    pub last_token_update: std::time::Instant,
+    pub token_rate: f64,        // tokens per second (smoothed)
+    pub token_flash: u8,        // frames remaining for highlight effect (0 = none)
+    prev_total_tokens: u64,
 }
 
 impl AppState {
@@ -72,15 +172,76 @@ impl AppState {
             status_message: None,
             throbber_frame: 0,
             throbber_state: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_creation: 0,
+            show_usage: true,
+            show_model: false,
+            show_context: true,
+            show_project: true,
+            pending_survey: None,
+            model_name: String::new(),
+            project_path: String::new(),
+            context_window: 200_000, // default, updated from model info
+            last_token_update: std::time::Instant::now(),
+            token_rate: 0.0,
+            token_flash: 0,
+            prev_total_tokens: 0,
         }
     }
 
     pub fn push_output(&mut self, content: String) {
-        self.raw_output.push(content.clone());
+        self.raw_output.push(RawEntry::Plain(content.clone()));
         for line in wrap_text(&content, self.term_width) {
-            self.output.push(OutputLine { content: line });
+            self.output.push(OutputLine { content: line, styled: None });
         }
         self.scroll_offset = 0;
+    }
+
+    /// Push markdown content — renders with styles and wraps.
+    pub fn push_markdown(&mut self, content: String) {
+        self.raw_output.push(RawEntry::Markdown(content.clone()));
+        let styled_lines = crate::markdown::render(&content);
+        for line in styled_lines {
+            for wrapped in wrap_styled_line(&line, self.term_width) {
+                let plain: String = wrapped.spans.iter().map(|s| s.content.as_ref()).collect();
+                self.output.push(OutputLine {
+                    content: plain,
+                    styled: Some(wrapped.spans),
+                });
+            }
+        }
+        self.scroll_offset = 0;
+    }
+
+    /// Tick token rate animation. Call each frame (~80ms).
+    pub fn tick_tokens(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_token_update).as_secs_f64();
+        let current_total = self.total_input_tokens + self.total_output_tokens;
+        let delta = current_total.saturating_sub(self.prev_total_tokens);
+
+        if delta > 0 && elapsed > 0.0 {
+            // Smoothed rate: blend new measurement with previous
+            let instant_rate = delta as f64 / elapsed;
+            self.token_rate = self.token_rate * 0.6 + instant_rate * 0.4;
+            self.token_flash = 6; // highlight for ~6 frames
+            self.last_token_update = now;
+            self.prev_total_tokens = current_total;
+        } else if elapsed > 1.0 {
+            // Decay rate when idle
+            self.token_rate *= 0.8;
+            if self.token_rate < 1.0 {
+                self.token_rate = 0.0;
+            }
+            self.last_token_update = now;
+            self.prev_total_tokens = current_total;
+        }
+
+        if self.token_flash > 0 {
+            self.token_flash -= 1;
+        }
     }
 
     /// Re-wrap all output for a new terminal width.
@@ -88,8 +249,24 @@ impl AppState {
         self.term_width = new_width;
         self.output.clear();
         for raw in &self.raw_output {
-            for line in wrap_text(raw, new_width) {
-                self.output.push(OutputLine { content: line });
+            match raw {
+                RawEntry::Plain(text) => {
+                    for line in wrap_text(text, new_width) {
+                        self.output.push(OutputLine { content: line, styled: None });
+                    }
+                }
+                RawEntry::Markdown(text) => {
+                    let styled_lines = crate::markdown::render(text);
+                    for line in styled_lines {
+                        for wrapped in wrap_styled_line(&line, new_width) {
+                            let plain: String = wrapped.spans.iter().map(|s| s.content.as_ref()).collect();
+                            self.output.push(OutputLine {
+                                content: plain,
+                                styled: Some(wrapped.spans),
+                            });
+                        }
+                    }
+                }
             }
         }
         self.scroll_offset = 0;
@@ -114,6 +291,12 @@ pub struct App {
     event_tx: mpsc::UnboundedSender<AppEvent>,
     last_enter: Option<std::time::Instant>,
     last_quit_attempt: Option<std::time::Instant>,
+    /// Input history for up/down cycling.
+    history: Vec<String>,
+    /// Current position in history (None = not browsing).
+    history_index: Option<usize>,
+    /// Saved current input when browsing history.
+    history_stash: String,
 }
 
 const DOUBLE_ENTER_MS: u64 = 300;
@@ -139,22 +322,26 @@ impl App {
             event_tx,
             last_enter: None,
             last_quit_attempt: None,
+            history: Vec::new(),
+            history_index: None,
+            history_stash: String::new(),
         }
     }
 
     /// Run the TUI event loop. Blocks until quit.
     pub fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+        crossterm::execute!(io::stdout(), EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
         loop {
-            // Tick throbber
+            // Tick animations
             {
                 let mut state = self.state.lock().unwrap();
                 if state.agent_active {
                     state.throbber_frame = (state.throbber_frame + 1) % 8;
                 }
+                state.tick_tokens();
             }
 
             terminal.draw(|frame| self.render(frame))?;
@@ -169,22 +356,49 @@ impl App {
                     continue;
                 }
 
+                if let Event::Mouse(mouse) = ev {
+                    match mouse.kind {
+                        event::MouseEventKind::ScrollUp => {
+                            let mut state = self.state.lock().unwrap();
+                            let max_scroll = state.output.len().saturating_sub(1);
+                            state.scroll_offset = (state.scroll_offset + 3).min(max_scroll);
+                        }
+                        event::MouseEventKind::ScrollDown => {
+                            let mut state = self.state.lock().unwrap();
+                            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 let key = match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => key,
                     _ => continue,
                 };
 
+                // Survey input takes priority
+                if self.handle_survey_key(key.code) {
+                    continue;
+                }
 
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let state = self.state.lock().unwrap();
-                            if state.agent_active {
-                                drop(state);
-                                let _ = self.event_tx.send(AppEvent::Interrupt);
+                            if !self.input_buffer.is_empty() {
+                                // Clear the input buffer
+                                self.input_buffer.clear();
+                                self.input_cursor = 0;
+                                self.history_index = None;
                             } else {
-                                drop(state);
-                                if self.try_quit() {
-                                    return Ok(());
+                                let state = self.state.lock().unwrap();
+                                if state.agent_active {
+                                    drop(state);
+                                    let _ = self.event_tx.send(AppEvent::Interrupt);
+                                } else {
+                                    drop(state);
+                                    if self.try_quit() {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
@@ -222,6 +436,8 @@ impl App {
                                 drop(state);
                                 if !self.input_buffer.is_empty() {
                                     let line = self.input_buffer.clone();
+                                    self.history.push(line.clone());
+                                    self.history_index = None;
                                     self.input_buffer.clear();
                                     self.input_cursor = 0;
                                     let _ = self.event_tx.send(AppEvent::Submit(line));
@@ -259,13 +475,40 @@ impl App {
                             self.input_cursor = self.input_buffer.len();
                         }
                         KeyCode::Up => {
-                            let mut state = self.state.lock().unwrap();
-                            let max_scroll = state.output.len().saturating_sub(1);
-                            state.scroll_offset = (state.scroll_offset + 1).min(max_scroll);
+                            if self.history.is_empty() {
+                                continue;
+                            }
+                            match self.history_index {
+                                None => {
+                                    // Start browsing from the end
+                                    self.history_stash = self.input_buffer.clone();
+                                    self.history_index = Some(self.history.len() - 1);
+                                }
+                                Some(idx) if idx > 0 => {
+                                    self.history_index = Some(idx - 1);
+                                }
+                                _ => {} // Already at oldest
+                            }
+                            if let Some(idx) = self.history_index {
+                                self.input_buffer = self.history[idx].clone();
+                                self.input_cursor = self.input_buffer.len();
+                            }
                         }
                         KeyCode::Down => {
-                            let mut state = self.state.lock().unwrap();
-                            state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                            match self.history_index {
+                                Some(idx) if idx + 1 < self.history.len() => {
+                                    self.history_index = Some(idx + 1);
+                                    self.input_buffer = self.history[idx + 1].clone();
+                                    self.input_cursor = self.input_buffer.len();
+                                }
+                                Some(_) => {
+                                    // Past the end — restore stash
+                                    self.history_index = None;
+                                    self.input_buffer = self.history_stash.clone();
+                                    self.input_cursor = self.input_buffer.len();
+                                }
+                                None => {} // Not browsing
+                            }
                         }
                         KeyCode::PageUp => {
                             let mut state = self.state.lock().unwrap();
@@ -289,12 +532,13 @@ impl App {
         let input_line_count = self.input_buffer.matches('\n').count() + 1;
         let input_height = (input_line_count as u16 + 2).max(3);
 
-        // Layout: output takes all space, input at bottom
+        // Layout: output, input, status bar
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(input_height),
+                Constraint::Length(1),
             ])
             .split(frame.area());
 
@@ -303,13 +547,73 @@ impl App {
         let visible_height = output_area.height as usize;
         let total_lines = state.output.len();
 
-        let all_lines: Vec<Line> = state.output
-            .iter()
-            .map(|line| Line::raw(&line.content))
-            .collect();
+        // Pad with empty lines so content is bottom-aligned
+        let padding = visible_height.saturating_sub(total_lines);
+        let mut all_lines: Vec<Line> = Vec::with_capacity(padding + total_lines);
+        for _ in 0..padding {
+            all_lines.push(Line::raw(""));
+        }
+        for line in &state.output {
+            if let Some(spans) = &line.styled {
+                all_lines.push(Line::from(spans.clone()));
+            } else {
+                all_lines.push(Line::raw(&line.content));
+            }
+        }
+
+        // Append survey if pending
+        if let Some(survey) = &state.pending_survey {
+            all_lines.push(Line::raw(""));
+            all_lines.push(Line::styled(
+                format!("  {}", survey.prompt),
+                Style::default().fg(Color::Cyan),
+            ));
+            all_lines.push(Line::raw(""));
+
+            let max_label = survey.options.iter().map(|o| o.label.len()).max().unwrap_or(0);
+
+            for (i, opt) in survey.options.iter().enumerate() {
+                let at_cursor = i == survey.cursor;
+                let is_selected = survey.selected[i];
+                let num = i + 1;
+                let arrow = if at_cursor { "\u{203a}" } else { " " };
+                let check = if survey.multi {
+                    if is_selected { "[x]" } else { "[ ]" }
+                } else {
+                    ""
+                };
+                let label_color = if at_cursor { Color::Cyan } else { Color::White };
+                let desc_color = if at_cursor { Color::Cyan } else { Color::DarkGray };
+                let desc = opt.description.as_deref().unwrap_or("");
+                let pad = " ".repeat(max_label.saturating_sub(opt.label.len()));
+
+                let mut spans = vec![
+                    Span::raw(format!("  {arrow} ")),
+                ];
+                if survey.multi {
+                    let check_style = if is_selected { Color::Green } else { Color::DarkGray };
+                    spans.push(Span::styled(format!("{check} "), Style::default().fg(check_style)));
+                }
+                spans.push(Span::styled(format!("{num}. {}", opt.label), Style::default().fg(label_color)));
+                spans.push(Span::raw(pad));
+                if !desc.is_empty() {
+                    spans.push(Span::styled(format!("  {desc}"), Style::default().fg(desc_color)));
+                }
+                all_lines.push(Line::from(spans));
+            }
+
+            all_lines.push(Line::raw(""));
+            let hint = if survey.multi {
+                "  space to select | enter to submit | esc to cancel"
+            } else {
+                "  enter to submit | esc to cancel"
+            };
+            all_lines.push(Line::styled(hint, Style::default().fg(Color::DarkGray)));
+        }
 
         // Scroll position: 0 = at bottom (most recent), so convert to top-based offset
-        let max_scroll = total_lines.saturating_sub(visible_height);
+        let padded_total = all_lines.len();
+        let max_scroll = padded_total.saturating_sub(visible_height);
         let clamped_offset = state.scroll_offset.min(max_scroll);
         let scroll_top = max_scroll.saturating_sub(clamped_offset);
 
@@ -317,31 +621,13 @@ impl App {
             .scroll((scroll_top as u16, 0));
         frame.render_widget(output_widget, output_area);
 
-        // ── Input pane ──
+        // ── Input pane ── (chunks[1])
         let input_area = chunks[1];
 
-        // Throbber in the top border
-        let border_title = if state.agent_active {
-            let frame_idx = state.throbber_frame as usize % THROBBER_FRAMES.len();
-            let chars = &THROBBER_FRAMES[frame_idx];
-            Span::styled(
-                format!(" {} working ", chars.join("")),
-                Style::default().fg(Color::Yellow),
-            )
-        } else if let Some(msg) = &state.status_message {
-            Span::styled(
-                format!(" {msg} "),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            Span::raw("")
-        };
-
         let input_block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
+            .borders(Borders::TOP)
             .border_type(ratatui::widgets::BorderType::Plain)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(border_title);
+            .border_style(Style::default().fg(Color::DarkGray));
 
         // Build input content: › prefix + buffer
         let prompt_span = Span::styled("\u{203a} ", Style::default().fg(Color::White).bold());
@@ -360,20 +646,152 @@ impl App {
         };
 
         let input_text = Paragraph::new(input_lines)
+            .style(Style::default().bg(Color::Rgb(30, 30, 30)))
             .block(input_block);
         frame.render_widget(input_text, input_area);
 
-        // Cursor position — account for › prefix and newlines
+        // Cursor position
         let (cursor_line, cursor_col) = cursor_position(&self.input_buffer, self.input_cursor);
-        let prefix_width: u16 = if cursor_line == 0 { 2 } else { 2 }; // "› " or "  "
+        let prefix_width: u16 = 2; // "› " or "  "
         let cursor_x = input_area.x + prefix_width + cursor_col as u16;
-        let cursor_y = input_area.y + 1 + cursor_line as u16; // +1 for top border
+        let cursor_y = input_area.y + 1 + cursor_line as u16;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+
+        // ── Status bar ── (chunks[2])
+        let status_area = chunks[2];
+        let mut status_parts: Vec<Span> = Vec::new();
+
+        // Throbber or status message (left side)
+        if state.agent_active {
+            let frame_idx = state.throbber_frame as usize % THROBBER_FRAMES.len();
+            let chars = &THROBBER_FRAMES[frame_idx];
+            status_parts.push(Span::styled(
+                format!(" {} working ", chars.join("")),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if let Some(msg) = &state.status_message {
+            status_parts.push(Span::styled(
+                format!(" {msg} "),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // Right-aligned parts as individually styled spans
+        let dim = Style::default().fg(Color::DarkGray);
+        let sep = Span::styled(" · ", dim);
+        let mut right_spans: Vec<Span> = Vec::new();
+
+        if state.show_model && !state.model_name.is_empty() {
+            right_spans.push(Span::styled(state.model_name.clone(), dim));
+        }
+
+        if state.show_usage && (state.total_input_tokens > 0 || state.total_output_tokens > 0) {
+            if !right_spans.is_empty() { right_spans.push(sep.clone()); }
+
+            // Color based on token rate
+            let token_color = token_rate_color(state.token_rate, state.token_flash);
+
+            let cache_info = if state.total_cache_read > 0 {
+                format!(" ({}↓cache)", format_tokens(state.total_cache_read))
+            } else {
+                String::new()
+            };
+
+            // Input tokens (↑)
+            right_spans.push(Span::styled(
+                format!("{}↑", format_tokens(state.total_input_tokens)),
+                Style::default().fg(token_color),
+            ));
+            right_spans.push(Span::styled(" ", dim));
+            // Output tokens (↓)
+            right_spans.push(Span::styled(
+                format!("{}↓", format_tokens(state.total_output_tokens)),
+                Style::default().fg(token_color),
+            ));
+            if !cache_info.is_empty() {
+                right_spans.push(Span::styled(cache_info, dim));
+            }
+        }
+
+        if state.show_context {
+            if !right_spans.is_empty() { right_spans.push(sep.clone()); }
+            let used = state.total_input_tokens;
+            let pct = if state.context_window > 0 {
+                100u64.saturating_sub((used * 100) / state.context_window)
+            } else {
+                100
+            };
+            let ctx_color = if pct > 50 {
+                Color::DarkGray
+            } else if pct > 20 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            right_spans.push(Span::styled(
+                format!("{pct}% context left"),
+                Style::default().fg(ctx_color),
+            ));
+        }
+
+        if state.show_project && !state.project_path.is_empty() {
+            if !right_spans.is_empty() { right_spans.push(sep.clone()); }
+            right_spans.push(Span::styled(state.project_path.clone(), dim));
+        }
+
+        // Calculate gap for right-alignment
+        let left_len: usize = status_parts.iter().map(|s| s.content.len()).sum();
+        let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum::<usize>() + 1;
+        let gap = (status_area.width as usize).saturating_sub(left_len + right_len);
+
+        status_parts.push(Span::raw(" ".repeat(gap)));
+        status_parts.extend(right_spans);
+        status_parts.push(Span::raw(" "));
+
+        let status_line = Paragraph::new(Line::from(status_parts));
+        frame.render_widget(status_line, status_area);
     }
 
 }
 
 const QUIT_WINDOW_MS: u128 = 2000;
+
+/// Color for token counter based on rate and flash state.
+/// Idle = dim, slow = gray, medium = white, fast = yellow, blazing = orange
+fn token_rate_color(rate: f64, flash: u8) -> Color {
+    if flash > 4 {
+        // Fresh burst — bright flash
+        return Color::White;
+    }
+    if flash > 2 {
+        return Color::Rgb(200, 200, 200);
+    }
+
+    if rate < 1.0 {
+        Color::DarkGray
+    } else if rate < 100.0 {
+        Color::Gray
+    } else if rate < 500.0 {
+        Color::White
+    } else if rate < 2000.0 {
+        Color::Yellow
+    } else if rate < 5000.0 {
+        Color::Rgb(255, 165, 0) // orange
+    } else {
+        Color::Rgb(255, 100, 50) // hot orange-red
+    }
+}
+
+/// Format token count as human-readable (e.g. 1.2k, 45.3k, 1.1M).
+fn format_tokens(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
 
 /// Calculate (line, col) from buffer position.
 fn cursor_position(buffer: &str, cursor: usize) -> (usize, usize) {
@@ -384,6 +802,81 @@ fn cursor_position(buffer: &str, cursor: usize) -> (usize, usize) {
 }
 
 impl App {
+    /// Handle a key press for a pending survey. Returns true if consumed.
+    fn handle_survey_key(&mut self, code: KeyCode) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let survey = match &mut state.pending_survey {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let option_count = survey.options.len();
+
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                survey.cursor = if survey.cursor == 0 { option_count - 1 } else { survey.cursor - 1 };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                survey.cursor = (survey.cursor + 1) % option_count;
+            }
+            KeyCode::Char(' ') if survey.multi => {
+                let c = survey.cursor;
+                survey.selected[c] = !survey.selected[c];
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < option_count {
+                    if survey.multi {
+                        survey.selected[idx] = !survey.selected[idx];
+                        survey.cursor = idx;
+                    } else {
+                        Self::submit_survey(&mut state, vec![idx]);
+                        return true;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let result = if survey.multi {
+                    survey.selected.iter().enumerate()
+                        .filter(|(_, s)| **s)
+                        .map(|(i, _)| i)
+                        .collect()
+                } else {
+                    vec![survey.cursor]
+                };
+                Self::submit_survey(&mut state, result);
+                return true;
+            }
+            KeyCode::Esc => {
+                let survey = state.pending_survey.take().unwrap();
+                state.push_output(format!("  {}", survey.prompt));
+                state.push_output("  (cancelled)".to_string());
+                state.push_output(String::new());
+                let _ = survey.response_tx.send(llm_code_sdk::tools::SurveyResponse { selected: vec![] });
+                return true;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Submit a survey answer and display the Q&A summary.
+    fn submit_survey(state: &mut AppState, selected: Vec<usize>) {
+        let survey = state.pending_survey.take().unwrap();
+        let labels: Vec<&str> = selected.iter()
+            .filter_map(|&i| survey.options.get(i).map(|o| o.label.as_str()))
+            .collect();
+
+        // Show Q&A summary
+        state.push_output(format!("  {}", survey.prompt));
+        let answers = labels.iter().map(|l| format!("\u{25b8} {l}")).collect::<Vec<_>>().join("  ");
+        state.push_output(format!("  {answers}"));
+        state.push_output(String::new());
+
+        let response = llm_code_sdk::tools::SurveyResponse { selected };
+        let _ = survey.response_tx.send(response);
+    }
+
     /// Returns true if we should actually quit, false if this was the first attempt.
     fn try_quit(&mut self) -> bool {
         let now = std::time::Instant::now();
@@ -402,7 +895,7 @@ impl App {
     /// Clean up terminal on exit.
     pub fn cleanup() -> io::Result<()> {
         disable_raw_mode()?;
-        crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
+        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture, LeaveAlternateScreen)?;
         Ok(())
     }
 }

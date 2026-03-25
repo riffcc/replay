@@ -17,6 +17,9 @@ struct SessionEntry {
     content: String,
     #[serde(default)]
     timestamp: Option<String>,
+    /// For "tool" role: the display line (e.g. "📚 Read(src/main.rs)")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<String>,
 }
 
 /// Metadata about a saved session (for listing).
@@ -75,6 +78,7 @@ pub fn save(project_dir: &Path, session_path: Option<&Path>, history: &[MessageP
             role: msg.role.clone(),
             content: text,
             timestamp: Some(now.clone()),
+            display: None,
         };
         let line = serde_json::to_string(&entry)?;
         writeln!(file, "{line}")?;

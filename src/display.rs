@@ -54,6 +54,9 @@ impl DisplayState {
             ToolEvent::ToolResult { name, success, output } => {
                 self.handle_result(name, *success, output);
             }
+            ToolEvent::Usage { .. } => {
+                // Handled by app state, not display
+            }
         }
     }
 
