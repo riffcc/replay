@@ -66,11 +66,13 @@ impl Tool for SpawnTool {
             format!("{task}\n\nContext: {context}")
         };
 
-        // Report spawning
-        {
+        // Register job
+        let job_id = {
             let mut s = self.app_state.lock().unwrap();
-            s.push_output(format!("🚀 Spawning subagent: {task}"));
-        }
+            let id = s.add_job(task.to_string());
+            s.push_output(format!("🚀 #{id} Spawning: {task}"));
+            id
+        };
 
         let model_id = self.model_id.lock().unwrap().clone();
         let model = crate::models::find_by_id(&model_id)
@@ -79,15 +81,19 @@ impl Tool for SpawnTool {
         let state = Arc::clone(&self.app_state);
         let progress: crate::subagent::ProgressCallback = Arc::new(move |task_name, status| {
             let mut s = state.lock().unwrap();
-            // Dim status updates from subagents
             s.push_output(format!("  \x1b[2m[{}] {}\x1b[0m", &task_name[..task_name.len().min(20)], status));
         });
 
         match crate::subagent::run(&full_task, &self.project_root, model, Some(progress)).await {
             Ok(result) => {
                 let mut s = self.app_state.lock().unwrap();
-                let icon = if result.success { "✅" } else { "❌" };
-                s.push_output(format!("{icon} Subagent done ({} tool calls): {}", result.tool_calls, &result.task[..result.task.len().min(40)]));
+                let (icon, status) = if result.success {
+                    ("✅", crate::app::JobStatus::Done)
+                } else {
+                    ("❌", crate::app::JobStatus::Failed)
+                };
+                s.update_job(job_id, status, result.tool_calls);
+                s.push_output(format!("{icon} #{job_id} done ({} calls): {}", result.tool_calls, &result.task[..result.task.len().min(50)]));
 
                 if result.success {
                     ToolResult::success(result.summary)
@@ -97,7 +103,8 @@ impl Tool for SpawnTool {
             }
             Err(e) => {
                 let mut s = self.app_state.lock().unwrap();
-                s.push_output(format!("❌ Subagent failed: {e:#}"));
+                s.update_job(job_id, crate::app::JobStatus::Failed, 0);
+                s.push_output(format!("❌ #{job_id} failed: {e:#}"));
                 ToolResult::error(format!("{e:#}"))
             }
         }

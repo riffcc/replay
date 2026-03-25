@@ -233,6 +233,33 @@ impl VoiceMeter {
     }
 }
 
+/// Info about an active or completed job (subagent).
+#[derive(Clone)]
+pub struct JobInfo {
+    pub id: u32,
+    pub task: String,
+    pub status: JobStatus,
+    pub started: std::time::Instant,
+    pub tool_calls: usize,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum JobStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            JobStatus::Running => write!(f, "running"),
+            JobStatus::Done => write!(f, "done"),
+            JobStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
 /// An interactive menu — used for model pickers, permission prompts, and agent surveys.
 /// Agent survey — the SDK's SurveyTool creates these. Separate from Menu.
 pub struct PendingSurvey {
@@ -320,6 +347,9 @@ pub struct AppState {
     pub voice_meter: VoiceMeter,
     /// Agent survey (from SDK SurveyTool).
     pub pending_survey: Option<PendingSurvey>,
+    /// Active jobs (subagents).
+    pub jobs: Vec<JobInfo>,
+    next_job_id: u32,
     /// Interactive menu (model picker, permission prompts, etc.).
     pub active_menu: Option<Menu>,
     /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
@@ -357,6 +387,8 @@ impl AppState {
             recording: false,
             voice_meter: VoiceMeter::new(),
             pending_survey: None,
+            jobs: Vec::new(),
+            next_job_id: 1,
             active_menu: None,
             pending_insert: None,
             model_name: String::new(),
@@ -398,6 +430,54 @@ impl AppState {
         self.token_rate = 0.0;
         self.prev_total_tokens = 0;
         self.scroll_offset = 0;
+    }
+
+    /// Register a new job and return its ID.
+    pub fn add_job(&mut self, task: String) -> u32 {
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.jobs.push(JobInfo {
+            id,
+            task,
+            status: JobStatus::Running,
+            started: std::time::Instant::now(),
+            tool_calls: 0,
+        });
+        id
+    }
+
+    /// Update a job's status.
+    pub fn update_job(&mut self, id: u32, status: JobStatus, tool_calls: usize) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.status = status;
+            job.tool_calls = tool_calls;
+        }
+    }
+
+    /// Format job list for /ps display.
+    pub fn format_ps(&self) -> String {
+        if self.jobs.is_empty() {
+            return "No jobs.".to_string();
+        }
+        let mut out = String::new();
+        for job in &self.jobs {
+            let elapsed = job.started.elapsed().as_secs();
+            let icon = match job.status {
+                JobStatus::Running => "◐",
+                JobStatus::Done => "✔",
+                JobStatus::Failed => "✗",
+            };
+            let task_preview = if job.task.len() > 60 {
+                format!("{}...", &job.task[..57])
+            } else {
+                job.task.clone()
+            };
+            out.push_str(&format!(
+                "  {icon} #{} {}s {}tc  {task_preview}\n",
+                job.id, elapsed, job.tool_calls
+            ));
+        }
+        out
     }
 
     pub fn push_output(&mut self, content: String) {
@@ -1177,17 +1257,19 @@ impl App {
                 String::new()
             };
 
-            // Input tokens (↑)
+            // Input tokens + green arrow
             right_spans.push(Span::styled(
-                format!("{}↑", format_tokens(state.total_input_tokens)),
+                format_tokens(state.total_input_tokens),
                 Style::default().fg(token_color),
             ));
+            right_spans.push(Span::styled("↑", Style::default().fg(Color::Green)));
             right_spans.push(Span::styled(" ", dim));
-            // Output tokens (↓)
+            // Output tokens + red arrow
             right_spans.push(Span::styled(
-                format!("{}↓", format_tokens(state.total_output_tokens)),
+                format_tokens(state.total_output_tokens),
                 Style::default().fg(token_color),
             ));
+            right_spans.push(Span::styled("↓", Style::default().fg(Color::Red)));
             if !cache_info.is_empty() {
                 right_spans.push(Span::styled(cache_info, dim));
             }
