@@ -1026,7 +1026,7 @@ impl App {
             let token_color = token_rate_color(state.token_rate, state.token_flash);
 
             let cache_info = if state.total_cache_read > 0 {
-                format!(" ({}↓cache)", format_tokens(state.total_cache_read))
+                format!(" ({}↓ cache)", format_tokens(state.total_cache_read))
             } else {
                 String::new()
             };
