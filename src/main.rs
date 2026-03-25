@@ -4,6 +4,8 @@ mod agent;
 mod ansi;
 mod app;
 mod beads;
+mod clipboard;
+mod compact;
 mod config;
 mod markdown;
 mod models;
@@ -247,12 +249,32 @@ async fn main() -> Result<()> {
                                 },
                             );
                         }
+                        "/compact" => {
+                            s.status_message = Some("Compacting context...".to_string());
+                            drop(s);
+                            let model_id = state.lock().unwrap().selected_model_id.clone();
+                            let model = models::find_by_id(&model_id)
+                                .unwrap_or(models::default_model());
+                            match compact::compact(&mut conversation, model).await {
+                                Ok(()) => {
+                                    let mut s = state.lock().unwrap();
+                                    s.status_message = None;
+                                    s.push_output("Context compacted.".to_string());
+                                }
+                                Err(e) => {
+                                    let mut s = state.lock().unwrap();
+                                    s.status_message = None;
+                                    s.push_output(format!("Compaction failed: {e:#}"));
+                                }
+                            }
+                        }
                         "/clear" => {
                             drop(s);
                             let _ = event_tx.send(AppEvent::Clear);
                         }
                         "/help" => {
                             s.push_output("/clear          Clear conversation context and output".to_string());
+                            s.push_output("/compact        Compress conversation history".to_string());
                             s.push_output("/usage          Toggle token usage display".to_string());
                             s.push_output("/model          Switch model".to_string());
                             s.push_output("/effort         Set reasoning effort".to_string());
@@ -373,12 +395,27 @@ async fn main() -> Result<()> {
                 agent_cancel = Some(Arc::clone(&cancelled));
 
                 let agent_state = Arc::clone(&state);
-                let (model_id, effort) = {
+                let (model_id, effort, last_input, ctx_window) = {
                     let s = state.lock().unwrap();
-                    (s.selected_model_id.clone(), s.reasoning_effort.clone())
+                    (s.selected_model_id.clone(), s.reasoning_effort.clone(),
+                     s.last_input_tokens, s.context_window)
                 };
                 let model = models::find_by_id(&model_id)
                     .unwrap_or(models::default_model());
+
+                // Auto-compact if approaching context limit
+                if compact::should_compact(last_input, ctx_window) {
+                    let mut s = state.lock().unwrap();
+                    s.status_message = Some("Compacting context...".to_string());
+                    drop(s);
+                    if let Err(e) = compact::compact(&mut conversation, model).await {
+                        let mut s = state.lock().unwrap();
+                        s.push_output(format!("compaction failed: {e:#}"));
+                    } else {
+                        let mut s = state.lock().unwrap();
+                        s.status_message = None;
+                    }
+                }
 
                 let agent_future = agent::execute(
                     &instruction,

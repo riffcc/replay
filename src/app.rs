@@ -565,6 +565,7 @@ const DOUBLE_ENTER_MS: u64 = 300;
 /// Available slash commands with descriptions.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Clear conversation context and output"),
+    ("/compact", "Compress conversation history"),
     ("/couch", "Toggle couch/gamepad mode"),
     ("/context", "Toggle context window display"),
     ("/effort", "Set reasoning effort (low/medium/high)"),
@@ -624,7 +625,12 @@ impl App {
     /// Run the TUI event loop. Blocks until quit.
     pub fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+        crossterm::execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
+        )?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
         loop {
@@ -691,6 +697,15 @@ impl App {
                     continue;
                 }
 
+                if let Event::Paste(text) = ev {
+                    // Multiline paste — normalize line endings and insert
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    self.input_buffer.insert_str(self.input_cursor, &text);
+                    self.input_cursor += text.len();
+                    self.voice_insert_start = None;
+                    continue;
+                }
+
                 let key = match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => key,
                     _ => continue,
@@ -721,6 +736,34 @@ impl App {
                                 }
                             }
                         }
+                        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl+V: check clipboard for images/files
+                            // (text paste is handled by bracketed paste above)
+                            match crate::clipboard::read() {
+                                crate::clipboard::ClipboardContent::Image(path) => {
+                                    let ref_text = format!("[image: {}]", path.display());
+                                    self.input_buffer.insert_str(self.input_cursor, &ref_text);
+                                    self.input_cursor += ref_text.len();
+                                    let mut state = self.state.lock().unwrap();
+                                    state.status_message = Some("Image pasted from clipboard".to_string());
+                                }
+                                crate::clipboard::ClipboardContent::Files(files) => {
+                                    let refs: Vec<String> = files.iter()
+                                        .map(|f| f.display().to_string())
+                                        .collect();
+                                    let text = refs.join("\n");
+                                    self.input_buffer.insert_str(self.input_cursor, &text);
+                                    self.input_cursor += text.len();
+                                }
+                                crate::clipboard::ClipboardContent::Text(text) => {
+                                    // Fallback if bracketed paste didn't fire
+                                    self.input_buffer.insert_str(self.input_cursor, &text);
+                                    self.input_cursor += text.len();
+                                }
+                                crate::clipboard::ClipboardContent::Empty => {}
+                            }
+                            self.voice_insert_start = None;
+                        }
                         KeyCode::Esc => {
                             let state = self.state.lock().unwrap();
                             if state.agent_active {
@@ -734,32 +777,41 @@ impl App {
                             }
                         }
                         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            // Shift-enter: insert newline
+                            // Shift-enter: insert newline (terminals that support it)
                             self.input_buffer.insert(self.input_cursor, '\n');
                             self.input_cursor += 1;
                         }
                         KeyCode::Enter => {
-                            let now = std::time::Instant::now();
-
-                            // Check double-enter for interrupt
-                            let is_double = self.last_enter
-                                .map(|prev| now.duration_since(prev).as_millis() < DOUBLE_ENTER_MS as u128)
-                                .unwrap_or(false);
-                            self.last_enter = Some(now);
-
-                            let state = self.state.lock().unwrap();
-                            if state.agent_active && is_double && self.input_buffer.is_empty() {
-                                drop(state);
-                                let _ = self.event_tx.send(AppEvent::Interrupt);
+                            // Check for trailing backslash — means "insert newline, don't submit"
+                            if self.input_cursor > 0 && self.input_buffer.as_bytes().get(self.input_cursor - 1) == Some(&b'\\') {
+                                // Replace the backslash with a newline
+                                self.input_cursor -= 1;
+                                self.input_buffer.remove(self.input_cursor);
+                                self.input_buffer.insert(self.input_cursor, '\n');
+                                self.input_cursor += 1;
                             } else {
-                                drop(state);
-                                if !self.input_buffer.is_empty() {
-                                    let line = self.input_buffer.clone();
-                                    self.history.push(line.clone());
-                                    self.history_index = None;
-                                    self.input_buffer.clear();
-                                    self.input_cursor = 0;
-                                    let _ = self.event_tx.send(AppEvent::Submit(line));
+                                let now = std::time::Instant::now();
+
+                                // Check double-enter for interrupt
+                                let is_double = self.last_enter
+                                    .map(|prev| now.duration_since(prev).as_millis() < DOUBLE_ENTER_MS as u128)
+                                    .unwrap_or(false);
+                                self.last_enter = Some(now);
+
+                                let state = self.state.lock().unwrap();
+                                if state.agent_active && is_double && self.input_buffer.is_empty() {
+                                    drop(state);
+                                    let _ = self.event_tx.send(AppEvent::Interrupt);
+                                } else {
+                                    drop(state);
+                                    if !self.input_buffer.is_empty() {
+                                        let line = self.input_buffer.clone();
+                                        self.history.push(line.clone());
+                                        self.history_index = None;
+                                        self.input_buffer.clear();
+                                        self.input_cursor = 0;
+                                        let _ = self.event_tx.send(AppEvent::Submit(line));
+                                    }
                                 }
                             }
                         }
@@ -1647,7 +1699,12 @@ impl App {
     /// Clean up terminal on exit.
     pub fn cleanup() -> io::Result<()> {
         disable_raw_mode()?;
-        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture, LeaveAlternateScreen)?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableMouseCapture,
+            LeaveAlternateScreen,
+        )?;
         Ok(())
     }
 }
