@@ -127,6 +127,7 @@ pub async fn execute(
     on_event: ToolEventCallback,
     survey_callback: llm_code_sdk::tools::SurveyCallback,
     history: &mut Vec<MessageParam>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String> {
     let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
         .context("MINIMAX_AUTH_TOKEN must be set")?;
@@ -160,6 +161,7 @@ pub async fn execute(
         max_iterations: Some(50),
         verbose: false,
         on_event: Some(on_event),
+        cancel: Some(cancel),
         ..Default::default()
     };
 

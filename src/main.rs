@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
     });
 
     // Main async loop: process events from the TUI
-    let mut agent_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
+    let mut agent_cancel: Option<Arc<AtomicBool>> = None;
 
     loop {
         let Some(event) = event_rx.recv().await else {
@@ -294,47 +294,56 @@ async fn main() -> Result<()> {
                     rx.recv().unwrap_or(llm_code_sdk::tools::SurveyResponse { selected: vec![] })
                 });
 
-                // Run agent
-                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-                agent_cancel = Some(cancel_tx);
+                // Run agent with cancellation flag
+                agent_cancel = Some(Arc::clone(&cancelled));
 
                 let agent_state = Arc::clone(&state);
-                let agent_target = target.clone();
-                let agent_cancelled = Arc::clone(&cancelled);
 
                 let agent_future = agent::execute(
                     &instruction,
-                    &agent_target,
+                    &target,
                     callback,
                     survey_cb,
                     &mut conversation,
+                    Arc::clone(&cancelled),
                 );
 
-                tokio::select! {
-                    result = agent_future => {
-                        let mut s = agent_state.lock().unwrap();
-                        s.agent_active = false;
-                        // If cancelled was set, the cancel branch already printed "(interrupted)".
-                        // Don't print error/result over that message.
-                        if agent_cancelled.load(Ordering::SeqCst) {
-                            s.push_output(String::new());
-                        } else if let Err(e) = result {
-                            s.push_output(format!("error: {e:#}"));
-                            s.push_output(String::new());
-                        } else {
-                            s.push_output(String::new());
+                // Race agent against interrupt events.
+                // The cancel flag is also checked inside the ToolRunner between
+                // iterations and tool calls, so even in-flight work stops promptly.
+                let result = tokio::select! {
+                    result = agent_future => result,
+                    _ = async {
+                        // Wait for interrupt events while agent runs
+                        loop {
+                            match event_rx.recv().await {
+                                Some(AppEvent::Interrupt) => {
+                                    cancelled.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+                                Some(AppEvent::Quit) => {
+                                    cancelled.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+                                None => break,
+                                _ => {} // ignore other events while agent runs
+                            }
                         }
-                    }
-                    _ = async { cancel_rx.await.ok() } => {
-                        cancelled.store(true, Ordering::SeqCst);
-                        let mut s = agent_state.lock().unwrap();
-                        s.agent_active = false;
-                        s.push_output("(interrupted)".to_string());
-                        s.push_output(String::new());
-                    }
-                }
+                    } => Err(anyhow::anyhow!("interrupted")),
+                };
 
                 agent_cancel = None;
+
+                {
+                    let mut s = agent_state.lock().unwrap();
+                    s.agent_active = false;
+                    if cancelled.load(Ordering::SeqCst) {
+                        s.push_output("(interrupted)".to_string());
+                    } else if let Err(e) = result {
+                        s.push_output(format!("error: {e:#}"));
+                    }
+                    s.push_output(String::new());
+                }
 
                 // Auto-save
                 match session::save(&target, session_path.as_deref(), &conversation) {
@@ -346,9 +355,8 @@ async fn main() -> Result<()> {
                 }
             }
             AppEvent::Interrupt => {
-                if let Some(cancel) = agent_cancel.take() {
-                    let _ = cancel.send(());
-                }
+                // Handled in the select! loop while agent is running.
+                // If we get here, no agent is active — ignore.
             }
             AppEvent::Clear => {
                 conversation.clear();
