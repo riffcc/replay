@@ -11,10 +11,12 @@ description = "Self-improving software orchestration"
 [dependencies]
 anyhow = "1"
 chrono = "0.4.44"
+cpal = "0.17.3"
 crossterm = "0.28"
 dirs = "6.0.0"
 dotenvy = "0.15"
 gilrs = "0.10"
+hound = "3.5.1"
 llm-code-sdk = { path = "../llm-code-sdk", features = ["smart", "search"] }
 pulldown-cmark = "0.13.3"
 ratatui = "0.30"
