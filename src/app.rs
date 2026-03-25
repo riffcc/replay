@@ -713,14 +713,18 @@ const DOUBLE_ENTER_MS: u64 = 300;
 
 /// Available slash commands with descriptions.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/attach", "Attach to background terminal (e.g. /attach 1)"),
+    ("/clean", "Remove completed background terminals"),
     ("/clear", "Clear conversation context and output"),
     ("/compact", "Compress conversation history"),
     ("/couch", "Toggle couch/gamepad mode"),
     ("/context", "Toggle context window display"),
     ("/effort", "Set reasoning effort (low/medium/high)"),
     ("/help", "Show available commands"),
+    ("/jobs", "Show background terminals"),
     ("/model", "Switch model or toggle model display"),
     ("/project", "Toggle project path display"),
+    ("/ps", "Show background terminals"),
     ("/usage", "Toggle token usage display"),
 ];
 

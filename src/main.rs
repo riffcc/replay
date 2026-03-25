@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
                             let registry = s.bash_process_registry.clone();
                             drop(s);
                             if let Some(registry) = registry {
-                                let reg = registry.blocking_lock();
+                                let reg = registry.try_lock().unwrap();
                                 let procs = reg.list();
                                 let running = reg.running_count();
                                 drop(reg);
@@ -323,7 +323,7 @@ async fn main() -> Result<()> {
                         "/clean" => {
                             let registry = s.bash_process_registry.clone();
                             let removed = if let Some(registry) = registry {
-                                let mut reg = registry.blocking_lock();
+                                let mut reg = registry.try_lock().unwrap();
                                 reg.clean()
                             } else {
                                 0
@@ -336,7 +336,7 @@ async fn main() -> Result<()> {
                                 if let Ok(id) = id_str.trim().parse::<u32>() {
                                     // Check the bash process registry for a valid writer
                                     let has_writer = s.bash_process_registry.as_ref()
-                                        .map(|r| r.blocking_lock().writer(id).is_some())
+                                        .map(|r| r.try_lock().unwrap().writer(id).is_some())
                                         .unwrap_or(false);
                                     if has_writer {
                                         s.attached_process = Some(id);
