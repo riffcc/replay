@@ -12,6 +12,7 @@ mod models;
 mod display;
 mod engine;
 mod session;
+mod process_manager;
 mod spawn_tool;
 mod subagent;
 mod survey_ui;
@@ -277,6 +278,12 @@ async fn main() -> Result<()> {
                         "/ps" | "/jobs" => {
                             let ps = s.format_ps();
                             s.push_output(ps);
+                        }
+                        "/clean" => {
+                            // Clean completed jobs
+                            let removed = s.jobs.iter().filter(|j| j.status != app::JobStatus::Running).count();
+                            s.jobs.retain(|j| j.status == app::JobStatus::Running);
+                            s.push_output(format!("Cleaned {removed} completed job(s)."));
                         }
                         "/help" => {
                             s.push_output("/clear          Clear conversation context and output".to_string());
