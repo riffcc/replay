@@ -873,13 +873,15 @@ impl App {
                             let pid = s.attached_process.take().unwrap();
                             s.push_output(format!("Detached from #{pid}"));
                         } else {
-                            // Forward keystroke as bytes to the process
+                            // Forward keystroke as bytes to the process via registry
                             let bytes = key_to_bytes(key.code, key.modifiers);
                             if !bytes.is_empty() {
                                 let state = self.state.lock().unwrap();
                                 if let Some(pid) = state.attached_process {
-                                    if let Some(writer) = state.process_writers.get(&pid) {
-                                        let _ = writer.try_send(bytes);
+                                    if let Some(registry) = &state.bash_process_registry {
+                                        if let Some(writer) = registry.blocking_lock().writer(pid) {
+                                            let _ = writer.try_send(bytes);
+                                        }
                                     }
                                 }
                             }

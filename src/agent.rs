@@ -132,7 +132,11 @@ fn build_system_prompt(project_root: &Path, skill_registry: &Arc<RwLock<SkillReg
     }
 }
 
-/// Execute a freeform instruction with conversation history. Returns the LLM's response.
+/// Return type includes the process registry for host-side /jobs.
+pub type ProcessRegistry = Arc<tokio::sync::Mutex<llm_code_sdk::tools::BgProcessRegistry>>;
+
+/// Execute a freeform instruction with conversation history.
+/// Returns (response_text, process_registry).
 pub async fn execute(
     instruction: &str,
     project_root: &Path,
@@ -143,7 +147,7 @@ pub async fn execute(
     model: &ModelDef,
     reasoning_effort: Option<String>,
     spawn_tool: Option<Arc<dyn Tool>>,
-) -> Result<String> {
+) -> Result<(String, ProcessRegistry)> {
     let api_key = crate::models::resolve_auth(model)
         .context(format!("no API key for {} ({})", model.name, model.provider))?;
 
@@ -206,7 +210,7 @@ pub async fn execute(
 
     history.push(MessageParam::assistant(&text));
 
-    Ok(text)
+    Ok((text, process_registry))
 }
 
 /// Run the agent against a single issue. Returns the LLM's summary.

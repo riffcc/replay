@@ -276,29 +276,63 @@ async fn main() -> Result<()> {
                             let _ = event_tx.send(AppEvent::Clear);
                         }
                         "/ps" | "/jobs" => {
-                            if s.jobs.is_empty() {
-                                s.push_output("No background terminals.".to_string());
+                            // Query the real process registry
+                            if let Some(registry) = &s.bash_process_registry {
+                                let reg = registry.blocking_lock();
+                                let procs = reg.list();
+                                if procs.is_empty() {
+                                    s.push_output("No background terminals.".to_string());
+                                } else {
+                                    s.push_output("Background terminals\n".to_string());
+                                    for p in &procs {
+                                        let icon = if p.exited {
+                                            if p.exit_code == Some(0) { "✔" } else { "✗" }
+                                        } else {
+                                            "◐"
+                                        };
+                                        let status = if p.exited {
+                                            match p.exit_code {
+                                                Some(0) => "Success".to_string(),
+                                                Some(c) => format!("Exited with code {c}"),
+                                                None => "Exited".to_string(),
+                                            }
+                                        } else {
+                                            "Running".to_string()
+                                        };
+                                        let cmd = if p.command.len() > 60 {
+                                            format!("{}...", &p.command[..57])
+                                        } else {
+                                            p.command.clone()
+                                        };
+                                        s.push_output(format!("  {icon} {cmd} ({status})"));
+                                    }
+                                    let running = reg.running_count();
+                                    s.push_output(String::new());
+                                    s.push_output(format!("  {running} running · /attach N to interact · /clean to remove"));
+                                }
                             } else {
-                                s.job_browser = Some(app::JobBrowser::new());
+                                s.push_output("No background terminals.".to_string());
                             }
                         }
                         "/clean" => {
-                            let dead_ids: Vec<u32> = s.jobs.iter()
-                                .filter(|j| j.status != app::JobStatus::Running)
-                                .map(|j| j.id)
-                                .collect();
-                            let removed = dead_ids.len();
-                            for id in &dead_ids {
-                                s.process_writers.remove(id);
-                                s.process_handles.remove(id);
-                            }
+                            let removed = if let Some(registry) = &s.bash_process_registry {
+                                let mut reg = registry.blocking_lock();
+                                reg.clean()
+                            } else {
+                                0
+                            };
+                            // Also clean old-style jobs
                             s.jobs.retain(|j| j.status == app::JobStatus::Running);
                             s.push_output(format!("Cleaned {removed} completed terminal(s)."));
                         }
                         cmd if cmd.starts_with("/attach ") => {
                             if let Some(id_str) = cmd.strip_prefix("/attach ") {
                                 if let Ok(id) = id_str.trim().parse::<u32>() {
-                                    if s.process_writers.contains_key(&id) {
+                                    // Check the bash process registry for a valid writer
+                                    let has_writer = s.bash_process_registry.as_ref()
+                                        .map(|r| r.blocking_lock().writer(id).is_some())
+                                        .unwrap_or(false);
+                                    if has_writer {
                                         s.attached_process = Some(id);
                                         s.push_output(format!("Attached to #{id}. Esc or Ctrl-D to detach."));
                                     } else {
@@ -523,8 +557,15 @@ async fn main() -> Result<()> {
                     s.agent_active = false;
                     if cancelled.load(Ordering::SeqCst) {
                         s.push_output("(interrupted)".to_string());
-                    } else if let Err(e) = result {
-                        s.push_output(format!("error: {e:#}"));
+                    } else {
+                        match result {
+                            Ok((_text, registry)) => {
+                                s.bash_process_registry = Some(registry);
+                            }
+                            Err(e) => {
+                                s.push_output(format!("error: {e:#}"));
+                            }
+                        }
                     }
                     s.push_output(String::new());
                 }
