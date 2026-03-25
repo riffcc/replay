@@ -463,9 +463,10 @@ impl AppState {
     /// Format job list for /ps display.
     pub fn format_ps(&self) -> String {
         if self.jobs.is_empty() {
-            return "No jobs.".to_string();
+            return "No background terminals.".to_string();
         }
-        let mut out = String::new();
+
+        let mut out = String::from("Background terminals\n\n");
         for job in &self.jobs {
             let elapsed = job.started.elapsed().as_secs();
             let icon = match job.status {
@@ -473,15 +474,28 @@ impl AppState {
                 JobStatus::Done => "✔",
                 JobStatus::Failed => "✗",
             };
+            let status_text = match job.status {
+                JobStatus::Running => format!("Running, {elapsed}s"),
+                JobStatus::Done => format!("Success, ran for {elapsed}s"),
+                JobStatus::Failed => format!("Failed, after {elapsed}s"),
+            };
             let task_preview = if job.task.len() > 60 {
                 format!("{}...", &job.task[..57])
             } else {
                 job.task.clone()
             };
+            out.push_str(&format!("  {icon} {task_preview} ({status_text})\n"));
+        }
+
+        let running = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
+        out.push('\n');
+        if running > 0 {
             out.push_str(&format!(
-                "  {icon} #{} {}s {}tc  {task_preview}\n",
-                job.id, elapsed, job.tool_calls
+                "  {running} background terminal{} running \u{00b7} /jobs to view \u{00b7} /clean to close\n",
+                if running == 1 { "" } else { "s" },
             ));
+        } else {
+            out.push_str("  No terminals running \u{00b7} /clean to remove completed\n");
         }
         out
     }

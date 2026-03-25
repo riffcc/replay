@@ -304,7 +304,9 @@ async fn main() -> Result<()> {
                             s.push_output("/context        Toggle context window display".to_string());
                             s.push_output("/project        Toggle project path display".to_string());
                             s.push_output("/couch [on|off] Toggle couch/gamepad mode".to_string());
-                            s.push_output("/ps             Show active and completed jobs".to_string());
+                            s.push_output("/jobs           Show background terminals".to_string());
+                            s.push_output("/attach N       Attach to background terminal N".to_string());
+                            s.push_output("/clean          Remove completed terminals".to_string());
                             s.push_output("/help           Show this help".to_string());
                         }
                         _ => {
