@@ -390,6 +390,8 @@ pub struct AppState {
     pub process_writers: std::collections::HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Process handles for termination, keyed by job ID.
     pub process_handles: std::collections::HashMap<u32, replay_pty::ProcessHandle>,
+    /// Shared background process registry from BashTool.
+    pub bash_process_registry: Option<std::sync::Arc<tokio::sync::Mutex<llm_code_sdk::tools::BgProcessRegistry>>>,
     /// Interactive menu (model picker, permission prompts, etc.).
     pub active_menu: Option<Menu>,
     /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
@@ -433,6 +435,7 @@ impl AppState {
             attached_process: None,
             process_writers: std::collections::HashMap::new(),
             process_handles: std::collections::HashMap::new(),
+            bash_process_registry: None,
             active_menu: None,
             pending_insert: None,
             model_name: String::new(),

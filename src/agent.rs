@@ -59,21 +59,25 @@ Respond with a brief summary of what you changed and why."#,
 }
 
 /// Create the tool set for the agent.
+/// Return type includes the process registry handle for the host.
 fn create_tools(
     project_root: &Path,
     skill_registry: &Arc<RwLock<SkillRegistry>>,
     survey_callback: llm_code_sdk::tools::SurveyCallback,
     spawn_tool: Option<Arc<dyn Tool>>,
-) -> Vec<Arc<dyn Tool>> {
+) -> (Vec<Arc<dyn Tool>>, Arc<tokio::sync::Mutex<llm_code_sdk::tools::BgProcessRegistry>>) {
     // Shared read tracker enforces read-before-write
     let tracker = llm_code_sdk::tools::smart::ReadTracker::new();
     let reader = SmartReadTool::with_tracker(project_root, tracker.clone());
     let writer = SmartWriteTool::with_tracker(project_root, tracker);
 
+    let bash = BashTool::new(project_root).with_timeout(30);
+    let process_registry = bash.process_registry();
+
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(reader),
         Arc::new(writer),
-        Arc::new(BashTool::new(project_root).with_timeout(30)),
+        Arc::new(bash),
         Arc::new(GlobTool::new(project_root)),
         Arc::new(GrepTool::new(project_root)),
         Arc::new(ListDirectoryTool::new(project_root)),
@@ -97,7 +101,7 @@ fn create_tools(
     let mcp_tools = llm_code_sdk::tools::mcp::connect_servers(&llm_code_sdk::tools::mcp::builtin_servers());
     tools.extend(mcp_tools);
 
-    tools
+    (tools, process_registry)
 }
 
 /// Discover agent skills and load AGENTS.md into the system prompt.
@@ -166,7 +170,7 @@ pub async fn execute(
         reg.discover(&local_skills);
     }
 
-    let tools = create_tools(project_root, &skill_registry, survey_callback, spawn_tool);
+    let (tools, process_registry) = create_tools(project_root, &skill_registry, survey_callback, spawn_tool);
 
     let config = ToolRunnerConfig {
         max_iterations: Some(50),
@@ -223,7 +227,7 @@ pub async fn solve(issue: &Issue, project_root: &Path, model: &ModelDef) -> Resu
     let noop_survey: llm_code_sdk::tools::SurveyCallback = Arc::new(|_| {
         llm_code_sdk::tools::SurveyResponse { selected: vec![] }
     });
-    let tools = create_tools(project_root, &skill_registry, noop_survey, None);
+    let (tools, _process_registry) = create_tools(project_root, &skill_registry, noop_survey, None);
 
     let on_event: ToolEventCallback = Arc::new(|event| {
         match &event {
