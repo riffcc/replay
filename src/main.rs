@@ -280,10 +280,20 @@ async fn main() -> Result<()> {
                             s.push_output(ps);
                         }
                         "/clean" => {
-                            // Clean completed jobs
                             let removed = s.jobs.iter().filter(|j| j.status != app::JobStatus::Running).count();
                             s.jobs.retain(|j| j.status == app::JobStatus::Running);
                             s.push_output(format!("Cleaned {removed} completed job(s)."));
+                        }
+                        cmd if cmd.starts_with("/attach ") => {
+                            if let Some(id_str) = cmd.strip_prefix("/attach ") {
+                                if let Ok(id) = id_str.trim().parse::<u32>() {
+                                    s.push_output(format!("Attached to process #{id}. Esc or Ctrl-D to detach."));
+                                    s.attached_process = Some(id);
+                                    // TODO: wire attached_writer from process manager
+                                } else {
+                                    s.push_output(format!("Invalid process ID: {id_str}"));
+                                }
+                            }
                         }
                         "/help" => {
                             s.push_output("/clear          Clear conversation context and output".to_string());
@@ -527,6 +537,21 @@ async fn main() -> Result<()> {
                     // Insert into input buffer — user can review before sending
                     s.pending_insert = Some(text);
                 }
+            }
+            AppEvent::Attach(id) => {
+                let mut s = state.lock().unwrap();
+                s.attached_process = Some(id);
+                s.push_output(format!("Attached to process #{id}. Esc or Ctrl-D to detach."));
+            }
+            AppEvent::Detach => {
+                let mut s = state.lock().unwrap();
+                if let Some(pid) = s.attached_process.take() {
+                    s.attached_writer = None;
+                    s.push_output(format!("Detached from process #{pid}"));
+                }
+            }
+            AppEvent::ProcessInput(_data) => {
+                // TODO: wire to process manager when integrated
             }
             AppEvent::Quit => {
                 break;

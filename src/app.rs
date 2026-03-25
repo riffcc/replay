@@ -350,6 +350,10 @@ pub struct AppState {
     /// Active jobs (subagents).
     pub jobs: Vec<JobInfo>,
     next_job_id: u32,
+    /// Attached to a background terminal (process ID). Keystrokes forwarded.
+    pub attached_process: Option<u32>,
+    /// Writer channel for attached process.
+    pub attached_writer: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Interactive menu (model picker, permission prompts, etc.).
     pub active_menu: Option<Menu>,
     /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
@@ -389,6 +393,8 @@ impl AppState {
             pending_survey: None,
             jobs: Vec::new(),
             next_job_id: 1,
+            attached_process: None,
+            attached_writer: None,
             active_menu: None,
             pending_insert: None,
             model_name: String::new(),
@@ -604,6 +610,12 @@ pub enum AppEvent {
     VoiceAudio(Vec<f32>),
     /// Voice transcription completed.
     VoiceTranscription(String),
+    /// Attach to a background terminal.
+    Attach(u32),
+    /// Detach from background terminal.
+    Detach,
+    /// Forward raw bytes to attached process.
+    ProcessInput(Vec<u8>),
 }
 
 /// The TUI application.
@@ -790,6 +802,33 @@ impl App {
                     Event::Key(key) if key.kind == KeyEventKind::Press => key,
                     _ => continue,
                 };
+
+                // Attached terminal mode — forward all keystrokes
+                {
+                    let state = self.state.lock().unwrap();
+                    if state.attached_process.is_some() {
+                        drop(state);
+                        // Ctrl-D or Esc detaches
+                        if key.code == KeyCode::Esc
+                            || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL))
+                        {
+                            let mut s = self.state.lock().unwrap();
+                            let pid = s.attached_process.take().unwrap();
+                            s.attached_writer = None;
+                            s.push_output(format!("Detached from process #{pid}"));
+                        } else {
+                            // Forward keystroke as bytes
+                            let bytes = key_to_bytes(key.code, key.modifiers);
+                            if !bytes.is_empty() {
+                                let state = self.state.lock().unwrap();
+                                if let Some(writer) = &state.attached_writer {
+                                    let _ = writer.try_send(bytes);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
 
                 // Survey and menu input take priority
                 if self.handle_survey_key(key.code) || self.handle_menu_key(key.code) {
@@ -1224,6 +1263,11 @@ impl App {
                 format!(" {} working ", chars.join("")),
                 Style::default().fg(Color::Yellow),
             ));
+        } else if let Some(pid) = state.attached_process {
+            status_parts.push(Span::styled(
+                format!(" 🖥 Attached to #{pid} — Esc to detach "),
+                Style::default().fg(Color::Cyan),
+            ));
         } else if let Some(msg) = &state.status_message {
             status_parts.push(Span::styled(
                 format!(" {msg} "),
@@ -1355,6 +1399,34 @@ fn format_tokens(count: u64) -> String {
         format!("{:.1}k", count as f64 / 1_000.0)
     } else {
         count.to_string()
+    }
+}
+
+/// Convert a key event to raw bytes for process stdin.
+fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+    match code {
+        KeyCode::Char(c) => {
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                // Ctrl+letter = ASCII 1-26
+                let ctrl = (c as u8).wrapping_sub(b'a').wrapping_add(1);
+                vec![ctrl]
+            } else {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                s.as_bytes().to_vec()
+            }
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        _ => vec![],
     }
 }
 
