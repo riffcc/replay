@@ -357,24 +357,25 @@ async fn main() -> Result<()> {
             }
             AppEvent::VoiceAudio(samples) => {
                 let tx = event_tx.clone();
+                let progress_state = Arc::clone(&state);
+                let on_progress: voice::ProgressCallback = Arc::new(move |msg| {
+                    let mut s = progress_state.lock().unwrap();
+                    s.status_message = Some(msg.to_string());
+                });
                 tokio::spawn(async move {
-                    match voice::transcribe(&samples).await {
+                    match voice::transcribe(&samples, Some(on_progress)).await {
                         Ok(text) => { let _ = tx.send(AppEvent::VoiceTranscription(text)); }
                         Err(e) => { let _ = tx.send(AppEvent::VoiceTranscription(format!("(error: {e})"))); }
                     }
                 });
             }
             AppEvent::VoiceTranscription(text) => {
+                let mut s = state.lock().unwrap();
                 if text.starts_with("(error:") {
-                    let mut s = state.lock().unwrap();
-                    s.push_output(text);
-                } else if !text.is_empty() {
-                    // Insert transcribed text into the input (or submit if in couch mode)
-                    let mut s = state.lock().unwrap();
-                    s.push_output(format!("\u{1F3A4} \"{text}\""));
-                    drop(s);
-                    // Re-inject as a submit event
-                    let _ = event_tx.send(AppEvent::Submit(text));
+                    s.status_message = Some(text);
+                } else if !text.trim().is_empty() {
+                    // Insert into input buffer — user can review before sending
+                    s.pending_insert = Some(text);
                 }
             }
             AppEvent::Quit => {
