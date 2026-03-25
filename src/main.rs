@@ -276,10 +276,15 @@ async fn main() -> Result<()> {
                             let _ = event_tx.send(AppEvent::Clear);
                         }
                         "/ps" | "/jobs" => {
-                            // Query the real process registry
-                            if let Some(registry) = &s.bash_process_registry {
+                            let registry = s.bash_process_registry.clone();
+                            drop(s);
+                            if let Some(registry) = registry {
                                 let reg = registry.blocking_lock();
                                 let procs = reg.list();
+                                let running = reg.running_count();
+                                drop(reg);
+
+                                let mut s = state.lock().unwrap();
                                 if procs.is_empty() {
                                     s.push_output("No background terminals.".to_string());
                                 } else {
@@ -306,22 +311,23 @@ async fn main() -> Result<()> {
                                         };
                                         s.push_output(format!("  {icon} {cmd} ({status})"));
                                     }
-                                    let running = reg.running_count();
                                     s.push_output(String::new());
                                     s.push_output(format!("  {running} running · /attach N to interact · /clean to remove"));
                                 }
                             } else {
+                                let mut s = state.lock().unwrap();
                                 s.push_output("No background terminals.".to_string());
                             }
+                            continue;
                         }
                         "/clean" => {
-                            let removed = if let Some(registry) = &s.bash_process_registry {
+                            let registry = s.bash_process_registry.clone();
+                            let removed = if let Some(registry) = registry {
                                 let mut reg = registry.blocking_lock();
                                 reg.clean()
                             } else {
                                 0
                             };
-                            // Also clean old-style jobs
                             s.jobs.retain(|j| j.status == app::JobStatus::Running);
                             s.push_output(format!("Cleaned {removed} completed terminal(s)."));
                         }
