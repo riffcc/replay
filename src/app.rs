@@ -610,6 +610,8 @@ pub enum AppEvent {
     VoiceAudio(Vec<f32>),
     /// Voice transcription completed.
     VoiceTranscription(String),
+    /// Spawn a background process (from bash tty/interactive mode).
+    SpawnBackground { command: String, mode: String },
     /// Attach to a background terminal.
     Attach(u32),
     /// Detach from background terminal.

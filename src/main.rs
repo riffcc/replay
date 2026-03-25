@@ -338,6 +338,7 @@ async fn main() -> Result<()> {
                 let cb_state = Arc::clone(&state);
                 let cb_verbose = verbose;
                 let cb_cancelled = Arc::clone(&cancelled);
+                let cb_event_tx = event_tx.clone();
                 let callback: llm_code_sdk::tools::ToolEventCallback = Arc::new(move |event| {
                     // If cancellation was requested, ignore this event to avoid
                     // overwriting the "(interrupted)" message with late results.
@@ -371,12 +372,27 @@ async fn main() -> Result<()> {
                         }
                         llm_code_sdk::tools::ToolEvent::ToolResult { name, success, output } => {
                             s.throbber_state = 1;
-                            let icon = if *success { "\x1b[32m●\x1b[0m" } else { "\x1b[31m●\x1b[0m" };
+
+                            // Detect background bash processes — send to main loop for async spawn
+                            if name == "bash" && output.contains("\"background\"") {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) {
+                                    if parsed.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        let mode = parsed.get("mode").and_then(|v| v.as_str()).unwrap_or("pipe").to_string();
+                                        let cmd = parsed.get("command").and_then(|v| v.as_str()).unwrap_or("???").to_string();
+                                        let _ = cb_event_tx.send(AppEvent::SpawnBackground {
+                                            command: cmd,
+                                            mode,
+                                        });
+                                    }
+                                }
+                            }
+
                             // For tasks, show the ANSI-styled output
                             if *name == "tasks" && !output.is_empty() {
                                 s.push_ansi(output.clone());
                             }
                             if cb_verbose {
+                                let icon = if *success { "\x1b[32m●\x1b[0m" } else { "\x1b[31m●\x1b[0m" };
                                 s.push_output(format!("  {icon} {name} output: {output}"));
                             }
                         }
@@ -536,6 +552,68 @@ async fn main() -> Result<()> {
                 } else if !text.trim().is_empty() {
                     // Insert into input buffer — user can review before sending
                     s.pending_insert = Some(text);
+                }
+            }
+            AppEvent::SpawnBackground { command, mode } => {
+                let spawn_mode = match mode.as_str() {
+                    "tty" => process_manager::SpawnMode::Pty,
+                    "interactive" => process_manager::SpawnMode::Pipe,
+                    _ => process_manager::SpawnMode::PipeNoStdin,
+                };
+                let mode_label = if mode == "tty" { "PTY" } else { "interactive" };
+
+                // Create a process manager for this spawn
+                let mut pm = process_manager::ProcessManager::new(&target);
+                match pm.spawn(&command, spawn_mode).await {
+                    Ok((id, mut stdout_rx, mut stderr_rx, exit_rx)) => {
+                        let mut s = state.lock().unwrap();
+                        let job_id = s.add_job(command.clone());
+                        s.push_output(format!("🖥 #{job_id} Background {mode_label}: {command}"));
+                        s.push_output("  Use /jobs to see status, /attach to interact".to_string());
+
+                        // Spawn output collector that feeds into AppState
+                        let out_state = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    chunk = stdout_rx.recv() => {
+                                        match chunk {
+                                            Some(data) => {
+                                                let text = String::from_utf8_lossy(&data);
+                                                let mut s = out_state.lock().unwrap();
+                                                s.push_output(format!("  [#{job_id}] {}", text.trim()));
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                    chunk = stderr_rx.recv() => {
+                                        match chunk {
+                                            Some(data) => {
+                                                let text = String::from_utf8_lossy(&data);
+                                                let mut s = out_state.lock().unwrap();
+                                                s.push_output(format!("  [#{job_id}] {}", text.trim()));
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                }
+                            }
+                            // Process exited
+                            let code = exit_rx.await.unwrap_or(1);
+                            let mut s = out_state.lock().unwrap();
+                            let status = if code == 0 {
+                                app::JobStatus::Done
+                            } else {
+                                app::JobStatus::Failed
+                            };
+                            s.update_job(job_id, status, 0);
+                            s.push_output(format!("🖥 #{job_id} exited (code {code})"));
+                        });
+                    }
+                    Err(e) => {
+                        let mut s = state.lock().unwrap();
+                        s.push_output(format!("Failed to spawn background process: {e}"));
+                    }
                 }
             }
             AppEvent::Attach(id) => {
