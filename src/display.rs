@@ -1,7 +1,7 @@
 //! Display system for agent tool calls.
 //!
 //! Handles progressive output: grouping reads/writes on one line,
-//! colored status bullets, and in-place updates.
+//! colored status bullets, in-place updates, and collapsible results.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -14,6 +14,7 @@ const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 
 /// Current display state for progressive output.
@@ -26,7 +27,6 @@ enum ActiveGroup {
 /// Display state shared across tool events.
 pub struct DisplayState {
     active: Option<ActiveGroup>,
-    /// The last non-grouped line content (without bullet), for redrawing on result.
     pending_line: Option<String>,
     verbose: bool,
 }
@@ -84,11 +84,7 @@ impl DisplayState {
             "bash" => {
                 self.flush();
                 let cmd = s("command");
-                let display_cmd = if cmd.len() > 80 {
-                    format!("{}...", &cmd[..77])
-                } else {
-                    cmd
-                };
+                let display_cmd = truncate(&cmd, 80);
                 let line = format!(">_ Bash({DIM}{display_cmd}{RESET})");
                 self.print_pending(&line);
             }
@@ -116,6 +112,9 @@ impl DisplayState {
                 let line = format!("\u{1F4C2} List({DIM}{path}{RESET})");
                 self.print_pending(&line);
             }
+            "survey" => {
+                self.flush();
+            }
             "tasks" => {
                 self.flush();
                 let op = s("operation");
@@ -132,7 +131,6 @@ impl DisplayState {
                 self.print_pending(&line);
             }
             "activate_skill" => {
-                // Skills get a one-line result on completion, no pending line
                 self.flush();
             }
             "skill_resource" => {
@@ -140,6 +138,27 @@ impl DisplayState {
                 let skill = s("skill");
                 let path = s("path");
                 let line = format!("\u{1F4CE} Resource({DIM}{skill}/{path}{RESET})");
+                self.print_pending(&line);
+            }
+            // MCP: DeepWiki tools
+            "ask_question" => {
+                self.flush();
+                let repo = s("repoName");
+                let question = s("question");
+                let preview = truncate(&question, 80);
+                let line = format!("\u{1F4DA} DeepWiki \u{2014} Ask({DIM}{repo}: {preview}{RESET})");
+                self.print_pending(&line);
+            }
+            "read_wiki_contents" => {
+                self.flush();
+                let repo = s("repoName");
+                let line = format!("\u{1F4DA} DeepWiki \u{2014} Read({DIM}{repo}{RESET})");
+                self.print_pending(&line);
+            }
+            "read_wiki_structure" => {
+                self.flush();
+                let repo = s("repoName");
+                let line = format!("\u{1F4DA} DeepWiki \u{2014} Structure({DIM}{repo}{RESET})");
                 self.print_pending(&line);
             }
             _ => {
@@ -150,7 +169,7 @@ impl DisplayState {
         }
 
         if self.verbose {
-            if name != "activate_skill" {
+            if !matches!(name, "activate_skill" | "survey") {
                 println!();
             }
             println!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default());
@@ -166,25 +185,16 @@ impl DisplayState {
                     println!("  output: {output}");
                 }
             }
+            "survey" => {
+                // Survey UI already rendered
+            }
             "tasks" => {
-                // Render task output as markdown for rich display
-                let bullet = if success {
-                    format!("{GREEN}●{RESET}")
-                } else {
-                    format!("{RED}●{RESET}")
-                };
-                if let Some(line) = self.pending_line.take() {
-                    let mut out = io::stdout();
-                    write!(out, "\r\x1b[2K{bullet} {line}").ok();
-                    out.flush().ok();
-                    println!();
-                }
+                self.finish_pending(success);
                 if !output.is_empty() {
                     termimad::print_text(output);
                 }
             }
             "activate_skill" => {
-                // One-line skill activation message
                 let skill_name = output
                     .lines()
                     .next()
@@ -196,20 +206,19 @@ impl DisplayState {
                     println!("{RED}●{RESET} skill activation failed");
                 }
             }
-            _ => {
-                let bullet = if success {
-                    format!("{GREEN}●{RESET}")
-                } else {
-                    format!("{RED}●{RESET}")
-                };
-                if let Some(line) = self.pending_line.take() {
-                    let mut out = io::stdout();
-                    write!(out, "\r\x1b[2K{bullet} {line}").ok();
-                    out.flush().ok();
-                    println!();
-                } else {
-                    println!("{bullet} {name}");
+            // MCP / DeepWiki: show truncated preview
+            "ask_question" | "read_wiki_contents" | "read_wiki_structure" => {
+                self.finish_pending(success);
+                if !output.is_empty() {
+                    let preview = truncate(output, 560);
+                    println!("  {DIM}{preview}{RESET}");
                 }
+                if self.verbose {
+                    println!("  output: {output}");
+                }
+            }
+            _ => {
+                self.finish_pending(success);
                 if self.verbose {
                     println!("  output: {output}");
                 }
@@ -217,7 +226,23 @@ impl DisplayState {
         }
     }
 
-    /// Print a line with a yellow pending bullet, storing it for later update.
+    /// Finish a pending line with a green/red bullet.
+    fn finish_pending(&mut self, success: bool) {
+        let bullet = if success {
+            format!("{GREEN}●{RESET}")
+        } else {
+            format!("{RED}●{RESET}")
+        };
+        if let Some(line) = self.pending_line.take() {
+            let mut out = io::stdout();
+            write!(out, "\r\x1b[2K{bullet} {line}").ok();
+            out.flush().ok();
+            println!();
+        } else {
+            // No pending line to update
+        }
+    }
+
     fn print_pending(&mut self, line: &str) {
         self.pending_line = Some(line.to_string());
         let mut out = io::stdout();
@@ -225,11 +250,9 @@ impl DisplayState {
         out.flush().ok();
     }
 
-    /// Redraw the current group line in place.
     fn redraw_group(&self) {
         let mut out = io::stdout();
         write!(out, "\r\x1b[2K").ok();
-
         match &self.active {
             Some(ActiveGroup::Reads { files }) => {
                 let file_list = files.join(", ");
@@ -244,16 +267,10 @@ impl DisplayState {
         out.flush().ok();
     }
 
-    /// Update the group's status bullet.
     fn update_group_status(&self, success: bool) {
-        let bullet = if success {
-            format!("{GREEN}●{RESET}")
-        } else {
-            format!("{RED}●{RESET}")
-        };
+        let bullet = if success { format!("{GREEN}●{RESET}") } else { format!("{RED}●{RESET}") };
         let mut out = io::stdout();
         write!(out, "\r\x1b[2K").ok();
-
         match &self.active {
             Some(ActiveGroup::Reads { files }) => {
                 let file_list = files.join(", ");
@@ -274,10 +291,18 @@ impl DisplayState {
             self.active = None;
         }
         if self.pending_line.is_some() {
-            // Pending line that never got a result — just newline
             println!();
             self.pending_line = None;
         }
+    }
+}
+
+/// Truncate a string to max chars with ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
     }
 }
 
