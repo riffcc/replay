@@ -23,7 +23,9 @@ pub struct OutputLine {
     pub styled: Option<Vec<Span<'static>>>,
 }
 
-/// Wrap a string to a given width, returning individual lines.
+/// Wrap a string to a given width with word-boundary reflow.
+/// Words that don't fit on the current line move to the next line.
+/// Words longer than `width` are force-broken by character.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -34,15 +36,70 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             lines.push(String::new());
             continue;
         }
-        let chars: Vec<char> = raw_line.chars().collect();
-        for chunk in chars.chunks(width.max(1)) {
-            lines.push(chunk.iter().collect());
+        let mut current = String::new();
+        let mut col: usize = 0;
+        for word in WordIter::new(raw_line) {
+            let wlen = word.chars().count();
+            if col > 0 && col + wlen > width {
+                lines.push(std::mem::take(&mut current));
+                col = 0;
+            }
+            if wlen > width && col == 0 {
+                let mut chars = word.chars();
+                while col < wlen {
+                    let take = (wlen - col).min(width);
+                    let chunk: String = chars.by_ref().take(take).collect();
+                    col += take;
+                    if col < wlen {
+                        lines.push(chunk);
+                        col = 0;
+                    } else {
+                        current.push_str(&chunk);
+                        col = take;
+                    }
+                }
+            } else {
+                current.push_str(word);
+                col += wlen;
+            }
         }
+        lines.push(current);
     }
     lines
 }
 
-/// Wrap a styled Line to a given width, splitting spans across lines.
+/// Iterator that yields words and whitespace runs as separate tokens.
+struct WordIter<'a> {
+    rest: &'a str,
+}
+
+impl<'a> WordIter<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { rest: s }
+    }
+}
+
+impl<'a> Iterator for WordIter<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<&'a str> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let bytes = self.rest.as_bytes();
+        let is_space = bytes[0] == b' ' || bytes[0] == b'\t';
+        let end = self.rest
+            .char_indices()
+            .skip(1)
+            .find(|(_, c)| (*c == ' ' || *c == '\t') != is_space)
+            .map(|(i, _)| i)
+            .unwrap_or(self.rest.len());
+        let token = &self.rest[..end];
+        self.rest = &self.rest[end..];
+        Some(token)
+    }
+}
+
+/// Wrap a styled Line to a given width with word-boundary reflow.
 fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return vec![line.clone()];
@@ -53,39 +110,57 @@ fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
         return vec![line.clone()];
     }
 
-    let mut result: Vec<Line<'static>> = Vec::new();
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut current_width: usize = 0;
-
+    let mut segments: Vec<(&str, Style)> = Vec::new();
     for span in &line.spans {
         let style = span.style;
-        let mut remaining: &str = &span.content;
+        let mut rest: &str = &span.content;
+        while !rest.is_empty() {
+            let bytes = rest.as_bytes();
+            let is_space = bytes[0] == b' ' || bytes[0] == b'\t';
+            let end = rest.char_indices()
+                .skip(1)
+                .find(|(_, c)| (*c == ' ' || *c == '\t') != is_space)
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            segments.push((&rest[..end], style));
+            rest = &rest[end..];
+        }
+    }
 
-        while !remaining.is_empty() {
-            let available = width.saturating_sub(current_width);
-            if available == 0 {
-                result.push(Line::from(std::mem::take(&mut current_spans)));
-                current_width = 0;
-                continue;
-            }
+    let mut result: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut col: usize = 0;
 
-            let char_count = remaining.chars().count();
-            if char_count <= available {
-                current_spans.push(Span::styled(remaining.to_string(), style));
-                current_width += char_count;
-                break;
-            } else {
-                // Split at available chars
-                let split_at: usize = remaining.char_indices()
-                    .nth(available)
-                    .map(|(i, _)| i)
-                    .unwrap_or(remaining.len());
-                let (take, rest) = remaining.split_at(split_at);
-                current_spans.push(Span::styled(take.to_string(), style));
-                result.push(Line::from(std::mem::take(&mut current_spans)));
-                current_width = 0;
-                remaining = rest;
+    for (seg, style) in &segments {
+        let slen = seg.chars().count();
+        if col > 0 && col + slen > width {
+            result.push(Line::from(std::mem::take(&mut current_spans)));
+            col = 0;
+        }
+        if slen > width && col == 0 {
+            let mut chars_remaining = seg.char_indices().peekable();
+            let mut taken = 0;
+            while taken < slen {
+                let take = (slen - taken).min(width);
+                let start_byte = chars_remaining.peek().map(|(i, _)| *i).unwrap_or(seg.len());
+                for _ in 0..take {
+                    chars_remaining.next();
+                }
+                let end_byte = chars_remaining.peek().map(|(i, _)| *i).unwrap_or(seg.len());
+                let chunk = &seg[start_byte..end_byte];
+                taken += take;
+                if taken < slen {
+                    current_spans.push(Span::styled(chunk.to_string(), *style));
+                    result.push(Line::from(std::mem::take(&mut current_spans)));
+                    col = 0;
+                } else {
+                    current_spans.push(Span::styled(chunk.to_string(), *style));
+                    col = take;
+                }
             }
+        } else {
+            current_spans.push(Span::styled(seg.to_string(), *style));
+            col += slen;
         }
     }
 
@@ -220,6 +295,8 @@ pub struct AppState {
     pub voice_meter: VoiceMeter,
     /// Pending survey for the user to answer.
     pub pending_survey: Option<PendingSurvey>,
+    /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
+    pub pending_insert: Option<String>,
     /// Token rate tracking for animation.
     pub last_token_update: std::time::Instant,
     pub token_rate: f64,        // tokens per second (smoothed)
@@ -252,6 +329,7 @@ impl AppState {
             recording: false,
             voice_meter: VoiceMeter::new(),
             pending_survey: None,
+            pending_insert: None,
             model_name: String::new(),
             project_path: String::new(),
             context_window: 200_000, // default, updated from model info
@@ -260,6 +338,19 @@ impl AppState {
             token_flash: 0,
             prev_total_tokens: 0,
         }
+    }
+
+    /// Clear all conversation state (output, tokens, scroll).
+    pub fn clear(&mut self) {
+        self.raw_output.clear();
+        self.output.clear();
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+        self.total_cache_read = 0;
+        self.total_cache_creation = 0;
+        self.token_rate = 0.0;
+        self.prev_total_tokens = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn push_output(&mut self, content: String) {
@@ -380,6 +471,8 @@ pub enum AppEvent {
     Quit,
     /// User double-entered to interrupt.
     Interrupt,
+    /// Clear conversation context.
+    Clear,
     /// Voice audio captured, needs transcription (runs in async context).
     VoiceAudio(Vec<f32>),
     /// Voice transcription completed.
@@ -408,9 +501,39 @@ pub struct App {
     back_last_tap: Option<std::time::Instant>,
     /// Active voice capture.
     voice_capture: Option<crate::voice::VoiceCapture>,
+    /// Left stick repeat throttle — last time we fired a stick-driven action.
+    stick_last_action: Option<std::time::Instant>,
+    /// Previous stick Y direction to detect new deflections.
+    stick_prev_y: i8,
+    /// Byte offset in input_buffer where voice transcription text starts (for replacement).
+    voice_insert_start: Option<usize>,
+    /// Last time we sent audio for streaming transcription.
+    voice_last_transcribe: Option<std::time::Instant>,
 }
 
 const DOUBLE_ENTER_MS: u64 = 300;
+
+/// Available slash commands with descriptions.
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/clear", "Clear conversation context and output"),
+    ("/couch", "Toggle couch/gamepad mode"),
+    ("/context", "Toggle context window display"),
+    ("/help", "Show available commands"),
+    ("/model", "Toggle model name display"),
+    ("/project", "Toggle project path display"),
+    ("/usage", "Toggle token usage display"),
+];
+
+/// Get matching slash commands for the current input prefix.
+fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.contains(' ') {
+        return Vec::new();
+    }
+    SLASH_COMMANDS.iter()
+        .filter(|(cmd, _)| cmd.starts_with(input) && *cmd != input)
+        .copied()
+        .collect()
+}
 
 // Throbber animation chars
 const THROBBER_FRAMES: [[&str; 4]; 8] = [
@@ -440,6 +563,10 @@ impl App {
             start_held_since: None,
             back_last_tap: None,
             voice_capture: None,
+            stick_last_action: None,
+            stick_prev_y: 0,
+            voice_insert_start: None,
+            voice_last_transcribe: None,
         }
     }
 
@@ -459,6 +586,26 @@ impl App {
                 state.tick_tokens();
                 if state.couch_mode_notify > 0 {
                     state.couch_mode_notify -= 1;
+                }
+            }
+
+            // Check for text to insert from voice transcription
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(text) = state.pending_insert.take() {
+                    // If we have a voice insert region, replace it
+                    if let Some(start) = self.voice_insert_start {
+                        let end = self.input_cursor.min(self.input_buffer.len());
+                        if start <= end && start <= self.input_buffer.len() {
+                            self.input_buffer.replace_range(start..end, &text);
+                            self.input_cursor = start + text.len();
+                        }
+                    } else {
+                        // First insert — mark the start position
+                        self.voice_insert_start = Some(self.input_cursor);
+                        self.input_buffer.insert_str(self.input_cursor, &text);
+                        self.input_cursor += text.len();
+                    }
                 }
             }
 
@@ -567,26 +714,44 @@ impl App {
                         }
                         KeyCode::Char(c) => {
                             self.input_buffer.insert(self.input_cursor, c);
-                            self.input_cursor += 1;
-                            // Clear status on any typing
+                            self.input_cursor += c.len_utf8();
+                            // Clear status and voice region on manual typing
                             self.last_quit_attempt = None;
+                            self.voice_insert_start = None;
                             let mut s = self.state.lock().unwrap();
                             s.status_message = None;
                         }
                         KeyCode::Backspace => {
                             if self.input_cursor > 0 {
                                 self.input_cursor -= 1;
+                                while self.input_cursor > 0 && !self.input_buffer.is_char_boundary(self.input_cursor) {
+                                    self.input_cursor -= 1;
+                                }
                                 self.input_buffer.remove(self.input_cursor);
                             }
                         }
                         KeyCode::Left => {
                             if self.input_cursor > 0 {
                                 self.input_cursor -= 1;
+                                while self.input_cursor > 0 && !self.input_buffer.is_char_boundary(self.input_cursor) {
+                                    self.input_cursor -= 1;
+                                }
                             }
                         }
                         KeyCode::Right => {
                             if self.input_cursor < self.input_buffer.len() {
                                 self.input_cursor += 1;
+                                while self.input_cursor < self.input_buffer.len() && !self.input_buffer.is_char_boundary(self.input_cursor) {
+                                    self.input_cursor += 1;
+                                }
+                            }
+                        }
+                        KeyCode::Tab => {
+                            // Complete first matching slash command
+                            let suggestions = slash_suggestions(&self.input_buffer);
+                            if let Some((cmd, _)) = suggestions.first() {
+                                self.input_buffer = cmd.to_string();
+                                self.input_cursor = self.input_buffer.len();
                             }
                         }
                         KeyCode::Home => {
@@ -649,8 +814,17 @@ impl App {
     fn render(&self, frame: &mut Frame) {
         let state = self.state.lock().unwrap();
 
-        // Input area height: 1 line per input line + 2 for borders
-        let input_line_count = self.input_buffer.matches('\n').count() + 1;
+        // Input area height: account for soft-wrapping within each line
+        let prefix_width: u16 = 2; // "› " or "  "
+        let input_content_width = (frame.area().width as usize).saturating_sub(prefix_width as usize + 1);
+        let input_line_count: usize = if input_content_width == 0 {
+            self.input_buffer.matches('\n').count() + 1
+        } else {
+            self.input_buffer.split('\n').map(|line| {
+                let clen = line.chars().count();
+                if clen == 0 { 1 } else { (clen + input_content_width - 1) / input_content_width }
+            }).sum()
+        };
         let input_height = (input_line_count as u16 + 2).max(3);
 
         // Layout: output, input, status bar
@@ -768,15 +942,40 @@ impl App {
 
         let input_text = Paragraph::new(input_lines)
             .style(Style::default().bg(Color::Rgb(30, 30, 30)))
-            .block(input_block);
+            .block(input_block)
+            .wrap(Wrap { trim: false });
         frame.render_widget(input_text, input_area);
 
-        // Cursor position
-        let (cursor_line, cursor_col) = cursor_position(&self.input_buffer, self.input_cursor);
-        let prefix_width: u16 = 2; // "› " or "  "
-        let cursor_x = input_area.x + prefix_width + cursor_col as u16;
-        let cursor_y = input_area.y + 1 + cursor_line as u16;
+        // Cursor position — account for soft-wrapping
+        let (visual_line, visual_col) = visual_cursor_position(
+            &self.input_buffer, self.input_cursor, input_content_width,
+        );
+        let cursor_x = input_area.x + prefix_width + visual_col as u16;
+        let cursor_y = input_area.y + 1 + visual_line as u16;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+
+        // ── Slash command suggestions ──
+        let suggestions = slash_suggestions(&self.input_buffer);
+        if !suggestions.is_empty() {
+            let suggestion_lines: Vec<Line> = suggestions.iter().map(|(cmd, desc)| {
+                Line::from(vec![
+                    Span::styled(format!("  {cmd}"), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
+                ])
+            }).collect();
+            let suggestion_height = suggestion_lines.len() as u16;
+            // Position above the input area
+            let suggestion_y = input_area.y.saturating_sub(suggestion_height);
+            let suggestion_area = Rect::new(
+                input_area.x,
+                suggestion_y,
+                input_area.width,
+                suggestion_height,
+            );
+            let suggestion_widget = Paragraph::new(suggestion_lines)
+                .style(Style::default().bg(Color::Rgb(40, 40, 40)));
+            frame.render_widget(suggestion_widget, suggestion_area);
+        }
 
         // ── Status bar ── (chunks[2])
         let status_area = chunks[2];
@@ -925,12 +1124,41 @@ fn format_tokens(count: u64) -> String {
     }
 }
 
-/// Calculate (line, col) from buffer position.
-fn cursor_position(buffer: &str, cursor: usize) -> (usize, usize) {
+/// Calculate (visual_line, visual_col) from buffer byte position,
+/// accounting for soft-wrapping at `wrap_width` characters.
+fn visual_cursor_position(buffer: &str, cursor: usize, wrap_width: usize) -> (usize, usize) {
     let before = &buffer[..cursor.min(buffer.len())];
-    let line = before.matches('\n').count();
-    let col = before.rfind('\n').map(|p| cursor - p - 1).unwrap_or(cursor);
-    (line, col)
+    let mut visual_line: usize = 0;
+    let last_newline = before.rfind('\n');
+
+    // Count visual lines for all complete hard lines before cursor
+    if let Some(nl_pos) = last_newline {
+        for hard_line in buffer[..nl_pos + 1].split('\n') {
+            let clen = hard_line.chars().count();
+            if wrap_width > 0 && clen > 0 {
+                visual_line += (clen + wrap_width - 1) / wrap_width;
+            } else {
+                visual_line += 1;
+            }
+        }
+        // split('\n') on "foo\nbar\n" yields a trailing "" for the line after
+        // the last newline — subtract it since we count that via col_in_hard_line
+        visual_line = visual_line.saturating_sub(1);
+    }
+
+    // Column within the current hard line
+    let col_in_hard_line = match last_newline {
+        Some(p) => before[p + 1..].chars().count(),
+        None => before.chars().count(),
+    };
+
+    // Account for wrapping within the current hard line
+    if wrap_width > 0 && col_in_hard_line > 0 {
+        visual_line += col_in_hard_line / wrap_width;
+        (visual_line, col_in_hard_line % wrap_width)
+    } else {
+        (visual_line, col_in_hard_line)
+    }
 }
 
 impl App {
@@ -956,6 +1184,49 @@ impl App {
                 gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => actions.push(KeyCode::PageDown),
                 _ => {}
             }
+        }
+
+        // Poll left thumbstick for navigation
+        {
+            let deadzone: f32 = 0.5;
+            let repeat_ms: u128 = 200;
+            let mut stick_y: f32 = 0.0;
+
+            if let Some(gp_ref) = &self.gilrs {
+                for (_id, gamepad) in gp_ref.gamepads() {
+                    let y = gamepad.value(gilrs::Axis::LeftStickY);
+                    if y.abs() > stick_y.abs() {
+                        stick_y = y;
+                    }
+                }
+            }
+
+            // Convert to direction: positive = up, negative = down (may be inverted on some controllers)
+            let dir: i8 = if stick_y > deadzone { 1 } else if stick_y < -deadzone { -1 } else { 0 };
+
+            if dir != 0 {
+                let should_fire = if dir != self.stick_prev_y {
+                    // New direction — fire immediately
+                    true
+                } else {
+                    // Same direction — throttle repeats
+                    self.stick_last_action
+                        .map(|t| t.elapsed().as_millis() >= repeat_ms)
+                        .unwrap_or(true)
+                };
+
+                if should_fire {
+                    if dir > 0 {
+                        actions.push(KeyCode::Up);
+                    } else {
+                        actions.push(KeyCode::Down);
+                    }
+                    self.stick_last_action = Some(std::time::Instant::now());
+                }
+            } else {
+                self.stick_last_action = None;
+            }
+            self.stick_prev_y = dir;
         }
 
         // Handle Start button hold for couch mode
@@ -989,36 +1260,53 @@ impl App {
                         match crate::voice::VoiceCapture::start() {
                             Ok(capture) => {
                                 self.voice_capture = Some(capture);
+                                self.voice_insert_start = Some(self.input_cursor);
+                                self.voice_last_transcribe = None;
                                 let mut state = self.state.lock().unwrap();
                                 state.recording = true;
-                                state.push_output("\u{1F3A4} Recording...".to_string());
                             }
                             Err(e) => {
                                 let mut state = self.state.lock().unwrap();
-                                state.push_output(format!("Voice error: {e}"));
+                                state.status_message = Some(format!("Voice: {e}"));
                             }
                         }
                     } else {
-                        // Update VU meter while recording
+                        // Update VU meter + send streaming transcription chunks
                         if let Some(capture) = &self.voice_capture {
                             let peak = capture.peak();
                             let mut state = self.state.lock().unwrap();
                             state.voice_meter.update(peak);
+
+                            // Send streaming chunk every 2 seconds
+                            let should_transcribe = self.voice_last_transcribe
+                                .map(|t| t.elapsed().as_secs() >= 2)
+                                .unwrap_or_else(|| {
+                                    // First chunk after 2s of recording
+                                    capture.duration_samples() >= 48_000
+                                });
+                            if should_transcribe {
+                                let samples = capture.samples_snapshot();
+                                if samples.len() >= 24_000 {
+                                    let _ = self.event_tx.send(AppEvent::VoiceAudio(samples));
+                                    self.voice_last_transcribe = Some(std::time::Instant::now());
+                                }
+                            }
                         }
                     }
                 } else if self.voice_capture.is_some() && !gamepad.is_pressed(gilrs::Button::Select) {
-                    // Released — stop and transcribe
+                    // Released — stop and do final transcription
                     if let Some(capture) = self.voice_capture.take() {
                         let audio = capture.stop();
                         let mut state = self.state.lock().unwrap();
                         state.recording = false;
 
-                        if audio.samples.len() < 12_000 { // less than 0.5s
-                            state.push_output("(too short to transcribe)".to_string());
-                        } else {
-                            state.push_output("\u{1F3A4} Transcribing...".to_string());
+                        if audio.samples.len() >= 24_000 { // at least 0.5s
                             let _ = self.event_tx.send(AppEvent::VoiceAudio(audio.samples));
                         }
+                        // Clear voice region tracking after final transcription is sent
+                        // (the pending_insert handler will do one last replacement)
+                        self.voice_last_transcribe = None;
+                        // Note: voice_insert_start is cleared when the user types or moves cursor
                     }
                 }
             }
