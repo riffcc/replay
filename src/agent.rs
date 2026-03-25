@@ -6,7 +6,8 @@ use llm_code_sdk::{
     SkillResourceTool, SystemPrompt, Tool, ToolRunner, ToolRunnerConfig,
 };
 use llm_code_sdk::tools::{
-    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, TasksTool, ToolEvent, ToolEventCallback,
+    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, SurveyTool, TasksTool,
+    ToolEvent, ToolEventCallback,
 };
 use llm_code_sdk::tools::smart::{SmartReadTool, SmartWriteTool};
 use std::path::Path;
@@ -60,7 +61,7 @@ Respond with a brief summary of what you changed and why."#,
 }
 
 /// Create the tool set for the agent.
-fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>) -> Vec<Arc<dyn Tool>> {
+fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>, survey_callback: llm_code_sdk::tools::SurveyCallback) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SmartReadTool::new(project_root)),
         Arc::new(SmartWriteTool::new(project_root)),
@@ -70,6 +71,7 @@ fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>
         Arc::new(ListDirectoryTool::new(project_root)),
         Arc::new(SearchTool::new(project_root)),
         Arc::new(TasksTool::new(project_root)),
+        Arc::new(SurveyTool::with_callback(survey_callback)),
     ];
 
     // Only add skill tools if there are skills to activate
@@ -77,6 +79,10 @@ fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>
         tools.push(Arc::new(ActivateSkillTool::new(Arc::clone(skill_registry))));
         tools.push(Arc::new(SkillResourceTool::new(Arc::clone(skill_registry))));
     }
+
+    // Connect MCP servers (builtins + any configured)
+    let mcp_tools = llm_code_sdk::tools::mcp::connect_servers(&llm_code_sdk::tools::mcp::builtin_servers());
+    tools.extend(mcp_tools);
 
     tools
 }
@@ -111,6 +117,7 @@ pub async fn execute(
     instruction: &str,
     project_root: &Path,
     on_event: ToolEventCallback,
+    survey_callback: llm_code_sdk::tools::SurveyCallback,
     history: &mut Vec<MessageParam>,
 ) -> Result<String> {
     let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
@@ -139,7 +146,7 @@ pub async fn execute(
         reg.discover(&local_skills);
     }
 
-    let tools = create_tools(project_root, &skill_registry);
+    let tools = create_tools(project_root, &skill_registry, survey_callback);
 
     let config = ToolRunnerConfig {
         max_iterations: Some(50),
@@ -191,7 +198,10 @@ pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
         .context("failed to create LLM client")?;
 
     let skill_registry = Arc::new(RwLock::new(SkillRegistry::new()));
-    let tools = create_tools(project_root, &skill_registry);
+    let noop_survey: llm_code_sdk::tools::SurveyCallback = Arc::new(|_| {
+        llm_code_sdk::tools::SurveyResponse { selected: vec![] }
+    });
+    let tools = create_tools(project_root, &skill_registry, noop_survey);
 
     let on_event: ToolEventCallback = Arc::new(|event| {
         match &event {
