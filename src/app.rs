@@ -233,7 +233,8 @@ impl VoiceMeter {
     }
 }
 
-/// A survey waiting for user input.
+/// An interactive menu — used for model pickers, permission prompts, and agent surveys.
+/// Agent survey — the SDK's SurveyTool creates these. Separate from Menu.
 pub struct PendingSurvey {
     pub prompt: String,
     pub options: Vec<llm_code_sdk::tools::SurveyOption>,
@@ -241,6 +242,24 @@ pub struct PendingSurvey {
     pub cursor: usize,
     pub selected: Vec<bool>,
     pub response_tx: std::sync::mpsc::Sender<llm_code_sdk::tools::SurveyResponse>,
+}
+
+/// Interactive menu — model picker, permission prompts, etc.
+/// Completely separate from the agent's survey system.
+pub struct Menu {
+    pub prompt: String,
+    pub options: Vec<MenuOption>,
+    pub cursor: usize,
+    /// Called with the selected index on Enter, or None on Esc.
+    pub on_select: Box<dyn FnOnce(Option<usize>) + Send>,
+}
+
+#[derive(Clone)]
+pub struct MenuOption {
+    pub label: String,
+    pub description: Option<String>,
+    /// Greyed out and unselectable when false.
+    pub enabled: bool,
 }
 
 /// Raw entry for re-wrapping on resize.
@@ -271,6 +290,8 @@ pub struct AppState {
     pub throbber_state: u8,
     /// Cumulative token usage for this session.
     pub total_input_tokens: u64,
+    /// Input tokens from the last API call (actual context usage).
+    pub last_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read: u64,
     pub total_cache_creation: u64,
@@ -281,6 +302,10 @@ pub struct AppState {
     pub show_project: bool,
     /// Model name.
     pub model_name: String,
+    /// Currently selected model ID (for agent::execute).
+    pub selected_model_id: String,
+    /// Reasoning effort for models that support it (low, medium, high).
+    pub reasoning_effort: Option<String>,
     /// Project directory path.
     pub project_path: String,
     /// Context window size (for percentage calculation).
@@ -293,8 +318,10 @@ pub struct AppState {
     pub recording: bool,
     /// Voice meter state (Codex-style braille VU).
     pub voice_meter: VoiceMeter,
-    /// Pending survey for the user to answer.
+    /// Agent survey (from SDK SurveyTool).
     pub pending_survey: Option<PendingSurvey>,
+    /// Interactive menu (model picker, permission prompts, etc.).
+    pub active_menu: Option<Menu>,
     /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
     pub pending_insert: Option<String>,
     /// Token rate tracking for animation.
@@ -317,6 +344,7 @@ impl AppState {
             throbber_frame: 0,
             throbber_state: 0,
             total_input_tokens: 0,
+            last_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read: 0,
             total_cache_creation: 0,
@@ -329,8 +357,11 @@ impl AppState {
             recording: false,
             voice_meter: VoiceMeter::new(),
             pending_survey: None,
+            active_menu: None,
             pending_insert: None,
             model_name: String::new(),
+            selected_model_id: String::new(),
+            reasoning_effort: None,
             project_path: String::new(),
             context_window: 200_000, // default, updated from model info
             last_token_update: std::time::Instant::now(),
@@ -340,11 +371,27 @@ impl AppState {
         }
     }
 
+    /// Show an interactive menu. Calls `on_select` with the chosen index (or None on cancel).
+    pub fn show_menu(
+        &mut self,
+        prompt: impl Into<String>,
+        options: Vec<MenuOption>,
+        on_select: impl FnOnce(Option<usize>) + Send + 'static,
+    ) {
+        self.active_menu = Some(Menu {
+            prompt: prompt.into(),
+            options,
+            cursor: 0,
+            on_select: Box::new(on_select),
+        });
+    }
+
     /// Clear all conversation state (output, tokens, scroll).
     pub fn clear(&mut self) {
         self.raw_output.clear();
         self.output.clear();
         self.total_input_tokens = 0;
+        self.last_input_tokens = 0;
         self.total_output_tokens = 0;
         self.total_cache_read = 0;
         self.total_cache_creation = 0;
@@ -520,8 +567,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Clear conversation context and output"),
     ("/couch", "Toggle couch/gamepad mode"),
     ("/context", "Toggle context window display"),
+    ("/effort", "Set reasoning effort (low/medium/high)"),
     ("/help", "Show available commands"),
-    ("/model", "Toggle model name display"),
+    ("/model", "Switch model or toggle model display"),
     ("/project", "Toggle project path display"),
     ("/usage", "Toggle token usage display"),
 ];
@@ -648,8 +696,8 @@ impl App {
                     _ => continue,
                 };
 
-                // Survey input takes priority
-                if self.handle_survey_key(key.code) {
+                // Survey and menu input take priority
+                if self.handle_survey_key(key.code) || self.handle_menu_key(key.code) {
                     continue;
                 }
 
@@ -859,7 +907,7 @@ impl App {
             }
         }
 
-        // Append survey if pending
+        // Render agent survey if pending
         if let Some(survey) = &state.pending_survey {
             all_lines.push(Line::raw(""));
             all_lines.push(Line::styled(
@@ -907,6 +955,52 @@ impl App {
                 "  enter to submit | esc to cancel"
             };
             all_lines.push(Line::styled(hint, Style::default().fg(Color::DarkGray)));
+        }
+
+        // Render interactive menu if active
+        if let Some(menu) = &state.active_menu {
+            all_lines.push(Line::raw(""));
+            all_lines.push(Line::styled(
+                format!("  {}", menu.prompt),
+                Style::default().fg(Color::Cyan),
+            ));
+            all_lines.push(Line::raw(""));
+
+            let max_label = menu.options.iter().map(|o| o.label.len()).max().unwrap_or(0);
+
+            for (i, opt) in menu.options.iter().enumerate() {
+                let at_cursor = i == menu.cursor;
+                let num = i + 1;
+                let arrow = if at_cursor { "\u{203a}" } else { " " };
+
+                if opt.enabled {
+                    let label_color = if at_cursor { Color::Cyan } else { Color::White };
+                    let desc_color = if at_cursor { Color::Cyan } else { Color::DarkGray };
+                    let desc = opt.description.as_deref().unwrap_or("");
+                    let pad = " ".repeat(max_label.saturating_sub(opt.label.len()));
+                    all_lines.push(Line::from(vec![
+                        Span::raw(format!("  {arrow} ")),
+                        Span::styled(format!("{num}. {}", opt.label), Style::default().fg(label_color)),
+                        Span::raw(pad),
+                        Span::styled(format!("  {desc}"), Style::default().fg(desc_color)),
+                    ]));
+                } else {
+                    let desc = opt.description.as_deref().unwrap_or("");
+                    let pad = " ".repeat(max_label.saturating_sub(opt.label.len()));
+                    let dim = Style::default().fg(Color::DarkGray);
+                    all_lines.push(Line::from(vec![
+                        Span::styled(format!("    {num}. {}", opt.label), dim),
+                        Span::styled(pad, dim),
+                        Span::styled(format!("  {desc}"), dim),
+                    ]));
+                }
+            }
+
+            all_lines.push(Line::raw(""));
+            all_lines.push(Line::styled(
+                "  enter to select | esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         // Scroll position: 0 = at bottom (most recent), so convert to top-based offset
@@ -1049,9 +1143,12 @@ impl App {
 
         if state.show_context {
             if !right_spans.is_empty() { right_spans.push(sep.clone()); }
-            let used = state.total_input_tokens;
-            let pct = if state.context_window > 0 {
+            let used = state.last_input_tokens;
+            let pct = if state.context_window > 0 && used > 0 {
                 100u64.saturating_sub((used * 100) / state.context_window)
+            } else if used == 0 && state.total_input_tokens > 0 {
+                // No last_input_tokens yet (e.g. resumed session) — estimate from cumulative
+                100
             } else {
                 100
             };
@@ -1340,7 +1437,9 @@ impl App {
 
         // Handle West (X) button: word-backspace in input, Space in survey
         if west_pressed {
-            let has_survey = self.state.lock().unwrap().pending_survey.is_some();
+            let state = self.state.lock().unwrap();
+            let has_survey = state.pending_survey.is_some() || state.active_menu.is_some();
+            drop(state);
             if has_survey {
                 actions.push(KeyCode::Char(' '));
             } else if self.input_cursor > 0 {
@@ -1366,8 +1465,7 @@ impl App {
 
         // Process collected actions
         for code in actions {
-            // Try survey first
-            if self.handle_survey_key(code) {
+            if self.handle_survey_key(code) || self.handle_menu_key(code) {
                 continue;
             }
 
@@ -1403,7 +1501,7 @@ impl App {
         }
     }
 
-    /// Handle a key press for a pending survey. Returns true if consumed.
+    /// Handle a key for the agent's survey. Returns true if consumed.
     fn handle_survey_key(&mut self, code: KeyCode) -> bool {
         let mut state = self.state.lock().unwrap();
         let survey = match &mut state.pending_survey {
@@ -1431,13 +1529,18 @@ impl App {
                         survey.selected[idx] = !survey.selected[idx];
                         survey.cursor = idx;
                     } else {
-                        Self::submit_survey(&mut state, vec![idx]);
+                        // Single-select: submit immediately
+                        let survey = state.pending_survey.take().unwrap();
+                        state.push_output(format!("  {}", survey.prompt));
+                        state.push_output(format!("  \u{25b8} {}", survey.options[idx].label));
+                        state.push_output(String::new());
+                        let _ = survey.response_tx.send(llm_code_sdk::tools::SurveyResponse { selected: vec![idx] });
                         return true;
                     }
                 }
             }
             KeyCode::Enter => {
-                let result = if survey.multi {
+                let selected: Vec<usize> = if survey.multi {
                     survey.selected.iter().enumerate()
                         .filter(|(_, s)| **s)
                         .map(|(i, _)| i)
@@ -1445,7 +1548,15 @@ impl App {
                 } else {
                     vec![survey.cursor]
                 };
-                Self::submit_survey(&mut state, result);
+                let survey = state.pending_survey.take().unwrap();
+                let labels: Vec<&str> = selected.iter()
+                    .filter_map(|&i| survey.options.get(i).map(|o| o.label.as_str()))
+                    .collect();
+                state.push_output(format!("  {}", survey.prompt));
+                let answers = labels.iter().map(|l| format!("\u{25b8} {l}")).collect::<Vec<_>>().join("  ");
+                state.push_output(format!("  {answers}"));
+                state.push_output(String::new());
+                let _ = survey.response_tx.send(llm_code_sdk::tools::SurveyResponse { selected });
                 return true;
             }
             KeyCode::Esc => {
@@ -1461,21 +1572,61 @@ impl App {
         true
     }
 
-    /// Submit a survey answer and display the Q&A summary.
-    fn submit_survey(state: &mut AppState, selected: Vec<usize>) {
-        let survey = state.pending_survey.take().unwrap();
-        let labels: Vec<&str> = selected.iter()
-            .filter_map(|&i| survey.options.get(i).map(|o| o.label.as_str()))
-            .collect();
+    /// Handle a key for the interactive menu. Returns true if consumed.
+    fn handle_menu_key(&mut self, code: KeyCode) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let menu = match &mut state.active_menu {
+            Some(m) => m,
+            None => return false,
+        };
 
-        // Show Q&A summary
-        state.push_output(format!("  {}", survey.prompt));
-        let answers = labels.iter().map(|l| format!("\u{25b8} {l}")).collect::<Vec<_>>().join("  ");
-        state.push_output(format!("  {answers}"));
-        state.push_output(String::new());
+        let count = menu.options.len();
 
-        let response = llm_code_sdk::tools::SurveyResponse { selected };
-        let _ = survey.response_tx.send(response);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                // Skip disabled options going up
+                let mut next = if menu.cursor == 0 { count - 1 } else { menu.cursor - 1 };
+                for _ in 0..count {
+                    if menu.options[next].enabled { break; }
+                    next = if next == 0 { count - 1 } else { next - 1 };
+                }
+                menu.cursor = next;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let mut next = (menu.cursor + 1) % count;
+                for _ in 0..count {
+                    if menu.options[next].enabled { break; }
+                    next = (next + 1) % count;
+                }
+                menu.cursor = next;
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < count && menu.options[idx].enabled {
+                    let menu = state.active_menu.take().unwrap();
+                    drop(state);
+                    (menu.on_select)(Some(idx));
+                    return true;
+                }
+            }
+            KeyCode::Enter => {
+                let idx = menu.cursor;
+                if menu.options[idx].enabled {
+                    let menu = state.active_menu.take().unwrap();
+                    drop(state);
+                    (menu.on_select)(Some(idx));
+                    return true;
+                }
+            }
+            KeyCode::Esc => {
+                let menu = state.active_menu.take().unwrap();
+                drop(state);
+                (menu.on_select)(None);
+                return true;
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Returns true if we should actually quit, false if this was the first attempt.

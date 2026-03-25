@@ -14,9 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::beads::Issue;
-
-/// The LLM model to use.
-const MODEL: &str = "MiniMax-M2.7-Highspeed";
+use crate::models::ModelDef;
 
 /// Build the system prompt for a given issue.
 fn system_prompt(issue: &Issue, project_root: &Path) -> String {
@@ -128,17 +126,19 @@ pub async fn execute(
     survey_callback: llm_code_sdk::tools::SurveyCallback,
     history: &mut Vec<MessageParam>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    model: &ModelDef,
+    reasoning_effort: Option<String>,
 ) -> Result<String> {
-    let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
-        .context("MINIMAX_AUTH_TOKEN must be set")?;
+    let api_key = crate::models::resolve_auth(model)
+        .context(format!("no API key for {} ({})", model.name, model.provider))?;
 
-    let base_url = std::env::var("MINIMAX_BASE_URL")
-        .unwrap_or_else(|_| "https://api.minimax.io/anthropic".into());
-
-    let client = Client::builder(&api_key)
-        .base_url(&base_url)
-        .format(ApiFormat::Anthropic)
-        .build()
+    let mut builder = Client::builder(&api_key)
+        .base_url(model.base_url)
+        .format(model.format);
+    if let Some(acc) = crate::models::codex_account_id() {
+        builder = builder.account_id(acc);
+    }
+    let client = builder.build()
         .context("failed to create LLM client")?;
 
     // Discover agent skills: ~/.replay/skills/ first, then project-local .replay/skills/
@@ -173,10 +173,11 @@ pub async fn execute(
     history.push(MessageParam::user(instruction));
 
     let params = MessageCreateParams {
-        model: MODEL.into(),
+        model: model.model_id.into(),
         max_tokens: 32000,
         messages: history.clone(),
         system,
+        reasoning_effort: if model.supports_effort { reasoning_effort } else { None },
         ..Default::default()
     };
 
@@ -194,17 +195,17 @@ pub async fn execute(
 }
 
 /// Run the agent against a single issue. Returns the LLM's summary.
-pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
-    let api_key = std::env::var("MINIMAX_AUTH_TOKEN")
-        .context("MINIMAX_AUTH_TOKEN must be set")?;
+pub async fn solve(issue: &Issue, project_root: &Path, model: &ModelDef) -> Result<String> {
+    let api_key = crate::models::resolve_auth(model)
+        .context(format!("no API key for {} ({})", model.name, model.provider))?;
 
-    let base_url = std::env::var("MINIMAX_BASE_URL")
-        .unwrap_or_else(|_| "https://api.minimax.io/anthropic".into());
-
-    let client = Client::builder(&api_key)
-        .base_url(&base_url)
-        .format(ApiFormat::Anthropic)
-        .build()
+    let mut builder = Client::builder(&api_key)
+        .base_url(model.base_url)
+        .format(model.format);
+    if let Some(acc) = crate::models::codex_account_id() {
+        builder = builder.account_id(acc);
+    }
+    let client = builder.build()
         .context("failed to create LLM client")?;
 
     let skill_registry = Arc::new(RwLock::new(SkillRegistry::new()));
@@ -239,7 +240,7 @@ pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
     let runner = ToolRunner::with_config(client, tools, config);
 
     let params = MessageCreateParams {
-        model: MODEL.into(),
+        model: model.model_id.into(),
         max_tokens: 32000,
         messages: vec![MessageParam::user("Solve this issue.")],
         system: Some(SystemPrompt::Text(system_prompt(issue, project_root))),

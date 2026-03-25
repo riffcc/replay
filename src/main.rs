@@ -4,7 +4,9 @@ mod agent;
 mod ansi;
 mod app;
 mod beads;
+mod config;
 mod markdown;
+mod models;
 mod display;
 mod engine;
 mod session;
@@ -100,11 +102,24 @@ async fn main() -> Result<()> {
         s.push_output(String::new());
     }
 
-    // Set initial state
+    // Set initial state from saved config
     {
+        let saved_model = config::saved_model()
+            .and_then(|id| models::find_by_id(&id))
+            .filter(|m| models::is_available(m))
+            .unwrap_or(models::default_model());
+
         let mut s = state.lock().unwrap();
         s.project_path = target.to_string_lossy().to_string();
-        s.model_name = "MiniMax-M2.7".to_string();
+        s.model_name = saved_model.name.to_string();
+        s.selected_model_id = saved_model.model_id.to_string();
+        s.context_window = saved_model.context_window;
+
+        if let Some(v) = config::display("show_usage") { s.show_usage = v; }
+        if let Some(v) = config::display("show_model") { s.show_model = v; }
+        if let Some(v) = config::display("show_context") { s.show_context = v; }
+        if let Some(v) = config::display("show_project") { s.show_project = v; }
+        s.reasoning_effort = config::get("reasoning_effort");
     }
 
     // Run TUI on a dedicated thread (it blocks for rendering)
@@ -151,7 +166,33 @@ async fn main() -> Result<()> {
                             s.show_model = false;
                         }
                         "/model" => {
-                            s.show_model = !s.show_model;
+                            let current_name = s.model_name.clone();
+                            let options: Vec<app::MenuOption> = models::MODELS.iter().map(|m| {
+                                app::MenuOption {
+                                    label: m.name.to_string(),
+                                    description: Some(m.provider.to_string()),
+                                    enabled: models::is_available(m),
+                                }
+                            }).collect();
+
+                            let picker_state = Arc::clone(&state);
+                            s.show_menu(
+                                format!("Select model (currently: {current_name})"),
+                                options,
+                                move |selected| {
+                                    if let Some(idx) = selected {
+                                        if let Some(m) = models::MODELS.get(idx) {
+                                            let mut s = picker_state.lock().unwrap();
+                                            s.selected_model_id = m.model_id.to_string();
+                                            s.model_name = m.name.to_string();
+                                            s.context_window = m.context_window;
+                                            s.show_model = true;
+                                            drop(s);
+                                            config::save_model(m.model_id);
+                                        }
+                                    }
+                                },
+                            );
                         }
                         "/context display always" | "/context display on" | "/context on" => {
                             s.show_context = true;
@@ -181,6 +222,31 @@ async fn main() -> Result<()> {
                             s.couch_mode_notify = 30;
                             s.push_output("🎮 Couch mode off".to_string());
                         }
+                        "/effort" => {
+                            let current = s.reasoning_effort.clone().unwrap_or_else(|| "medium".to_string());
+                            let options = ["low", "medium", "high", "xhigh"].iter().map(|&e| {
+                                app::MenuOption {
+                                    label: e.to_string(),
+                                    description: None,
+                                    enabled: true,
+                                }
+                            }).collect();
+
+                            let picker_state = Arc::clone(&state);
+                            s.show_menu(
+                                format!("Set reasoning effort (currently: {current})"),
+                                options,
+                                move |selected| {
+                                    if let Some(idx) = selected {
+                                        let effort = ["low", "medium", "high", "xhigh"][idx];
+                                        let mut s = picker_state.lock().unwrap();
+                                        s.reasoning_effort = Some(effort.to_string());
+                                        drop(s);
+                                        config::set("reasoning_effort", effort);
+                                    }
+                                },
+                            );
+                        }
                         "/clear" => {
                             drop(s);
                             let _ = event_tx.send(AppEvent::Clear);
@@ -188,7 +254,8 @@ async fn main() -> Result<()> {
                         "/help" => {
                             s.push_output("/clear          Clear conversation context and output".to_string());
                             s.push_output("/usage          Toggle token usage display".to_string());
-                            s.push_output("/model          Toggle model name display".to_string());
+                            s.push_output("/model          Switch model".to_string());
+                            s.push_output("/effort         Set reasoning effort".to_string());
                             s.push_output("/context        Toggle context window display".to_string());
                             s.push_output("/project        Toggle project path display".to_string());
                             s.push_output("/couch [on|off] Toggle couch/gamepad mode".to_string());
@@ -197,6 +264,13 @@ async fn main() -> Result<()> {
                         _ => {
                             s.push_output(format!("Unknown command: {instruction}"));
                         }
+                    }
+                    // Persist display preferences (skip if show_menu consumed the lock)
+                    if let Ok(s) = state.try_lock() {
+                        config::save_display("show_usage", s.show_usage);
+                        config::save_display("show_model", s.show_model);
+                        config::save_display("show_context", s.show_context);
+                        config::save_display("show_project", s.show_project);
                     }
                     continue;
                 }
@@ -262,6 +336,7 @@ async fn main() -> Result<()> {
                         }
                         llm_code_sdk::tools::ToolEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens } => {
                             s.total_input_tokens += input_tokens;
+                            s.last_input_tokens = *input_tokens;
                             s.total_output_tokens += output_tokens;
                             s.total_cache_read += cache_read_tokens;
                             s.total_cache_creation += cache_creation_tokens;
@@ -298,6 +373,12 @@ async fn main() -> Result<()> {
                 agent_cancel = Some(Arc::clone(&cancelled));
 
                 let agent_state = Arc::clone(&state);
+                let (model_id, effort) = {
+                    let s = state.lock().unwrap();
+                    (s.selected_model_id.clone(), s.reasoning_effort.clone())
+                };
+                let model = models::find_by_id(&model_id)
+                    .unwrap_or(models::default_model());
 
                 let agent_future = agent::execute(
                     &instruction,
@@ -306,6 +387,8 @@ async fn main() -> Result<()> {
                     survey_cb,
                     &mut conversation,
                     Arc::clone(&cancelled),
+                    model,
+                    effort,
                 );
 
                 // Race agent against interrupt events.

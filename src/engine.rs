@@ -23,7 +23,8 @@ pub async fn run(target: &Path, issue: &Issue) -> Result<Outcome> {
 
     tracing::info!("claimed {}", issue.id);
 
-    let summary = agent::solve(issue, target).await
+    let model = crate::models::default_model();
+    let summary = agent::solve(issue, target, model).await
         .with_context(|| format!("agent failed on {}", issue.id))?;
 
     tracing::info!("agent summary:\n{summary}");
