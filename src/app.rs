@@ -384,10 +384,12 @@ pub struct AppState {
     next_job_id: u32,
     /// Job browser state (None = not browsing).
     pub job_browser: Option<JobBrowser>,
-    /// Attached to a background terminal (process ID). Keystrokes forwarded.
+    /// Attached to a background terminal (job ID). Keystrokes forwarded.
     pub attached_process: Option<u32>,
-    /// Writer channel for attached process.
-    pub attached_writer: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Writer channels for background processes, keyed by job ID.
+    pub process_writers: std::collections::HashMap<u32, tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// Process handles for termination, keyed by job ID.
+    pub process_handles: std::collections::HashMap<u32, replay_pty::ProcessHandle>,
     /// Interactive menu (model picker, permission prompts, etc.).
     pub active_menu: Option<Menu>,
     /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
@@ -429,7 +431,8 @@ impl AppState {
             next_job_id: 1,
             job_browser: None,
             attached_process: None,
-            attached_writer: None,
+            process_writers: std::collections::HashMap::new(),
+            process_handles: std::collections::HashMap::new(),
             active_menu: None,
             pending_insert: None,
             model_name: String::new(),
@@ -865,15 +868,16 @@ impl App {
                         {
                             let mut s = self.state.lock().unwrap();
                             let pid = s.attached_process.take().unwrap();
-                            s.attached_writer = None;
-                            s.push_output(format!("Detached from process #{pid}"));
+                            s.push_output(format!("Detached from #{pid}"));
                         } else {
-                            // Forward keystroke as bytes
+                            // Forward keystroke as bytes to the process
                             let bytes = key_to_bytes(key.code, key.modifiers);
                             if !bytes.is_empty() {
                                 let state = self.state.lock().unwrap();
-                                if let Some(writer) = &state.attached_writer {
-                                    let _ = writer.try_send(bytes);
+                                if let Some(pid) = state.attached_process {
+                                    if let Some(writer) = state.process_writers.get(&pid) {
+                                        let _ = writer.try_send(bytes);
+                                    }
                                 }
                             }
                         }
@@ -1920,13 +1924,17 @@ impl App {
                                 state.push_output(format!("Attached to #{job_id}. Esc or Ctrl-D to detach."));
                             }
                             1 => {
-                                // Stop
+                                // Stop — terminate the process
+                                if let Some(handle) = state.process_handles.get(&job_id) {
+                                    handle.terminate();
+                                }
                                 if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
                                     job.status = JobStatus::Failed;
                                 }
+                                state.process_writers.remove(&job_id);
+                                state.process_handles.remove(&job_id);
                                 state.push_output(format!("Stopped #{job_id}"));
                                 state.job_browser.as_mut().unwrap().mode = JobBrowserMode::List;
-                                // TODO: actually kill the process via process manager
                             }
                             2 => {
                                 // Set Timeout — for now just show a message

@@ -283,16 +283,27 @@ async fn main() -> Result<()> {
                             }
                         }
                         "/clean" => {
-                            let removed = s.jobs.iter().filter(|j| j.status != app::JobStatus::Running).count();
+                            let dead_ids: Vec<u32> = s.jobs.iter()
+                                .filter(|j| j.status != app::JobStatus::Running)
+                                .map(|j| j.id)
+                                .collect();
+                            let removed = dead_ids.len();
+                            for id in &dead_ids {
+                                s.process_writers.remove(id);
+                                s.process_handles.remove(id);
+                            }
                             s.jobs.retain(|j| j.status == app::JobStatus::Running);
-                            s.push_output(format!("Cleaned {removed} completed job(s)."));
+                            s.push_output(format!("Cleaned {removed} completed terminal(s)."));
                         }
                         cmd if cmd.starts_with("/attach ") => {
                             if let Some(id_str) = cmd.strip_prefix("/attach ") {
                                 if let Ok(id) = id_str.trim().parse::<u32>() {
-                                    s.push_output(format!("Attached to process #{id}. Esc or Ctrl-D to detach."));
-                                    s.attached_process = Some(id);
-                                    // TODO: wire attached_writer from process manager
+                                    if s.process_writers.contains_key(&id) {
+                                        s.attached_process = Some(id);
+                                        s.push_output(format!("Attached to #{id}. Esc or Ctrl-D to detach."));
+                                    } else {
+                                        s.push_output(format!("Process #{id} not found or not interactive."));
+                                    }
                                 } else {
                                     s.push_output(format!("Invalid process ID: {id_str}"));
                                 }
@@ -560,23 +571,49 @@ async fn main() -> Result<()> {
                 }
             }
             AppEvent::SpawnBackground { command, mode } => {
-                let spawn_mode = match mode.as_str() {
-                    "tty" => process_manager::SpawnMode::Pty,
-                    "interactive" => process_manager::SpawnMode::Pipe,
-                    _ => process_manager::SpawnMode::PipeNoStdin,
-                };
                 let mode_label = if mode == "tty" { "PTY" } else { "interactive" };
 
-                // Create a process manager for this spawn
-                let mut pm = process_manager::ProcessManager::new(&target);
-                match pm.spawn(&command, spawn_mode).await {
-                    Ok((id, mut stdout_rx, mut stderr_rx, exit_rx)) => {
-                        let mut s = state.lock().unwrap();
-                        let job_id = s.add_job(command.clone());
-                        s.push_output(format!("🖥 #{job_id} Background {mode_label}: {command}"));
-                        s.push_output("  Use /jobs to see status, /attach to interact".to_string());
+                // Spawn directly via replay-pty
+                let args = vec!["-c".to_string(), command.clone()];
+                let env: std::collections::HashMap<String, String> = [
+                    ("GIT_TERMINAL_PROMPT", "0"),
+                    ("PAGER", "cat"),
+                    ("GIT_PAGER", "cat"),
+                    ("TERM", "xterm-256color"),
+                ].into_iter().map(|(k,v)| (k.to_string(), v.to_string())).collect();
+                let arg0: Option<String> = None;
 
-                        // Spawn output collector that feeds into AppState
+                let spawn_result = match mode.as_str() {
+                    "tty" => {
+                        let size = replay_pty::TerminalSize { rows: 24, cols: 120 };
+                        replay_pty::spawn_pty_process("bash", &args, &target, &env, &arg0, size).await
+                    }
+                    "interactive" => {
+                        replay_pty::spawn_pipe_process("bash", &args, &target, &env, &arg0).await
+                    }
+                    _ => {
+                        replay_pty::spawn_pipe_process_no_stdin("bash", &args, &target, &env, &arg0).await
+                    }
+                };
+
+                match spawn_result {
+                    Ok(spawned) => {
+                        let writer = spawned.session.writer_sender();
+                        let mut stdout_rx = spawned.stdout_rx;
+                        let mut stderr_rx = spawned.stderr_rx;
+                        let exit_rx = spawned.exit_rx;
+
+                        let job_id = {
+                            let mut s = state.lock().unwrap();
+                            let id = s.add_job(command.clone());
+                            s.process_writers.insert(id, writer);
+                            s.process_handles.insert(id, spawned.session);
+                            s.push_output(format!("🖥 #{id} Background {mode_label}: {command}"));
+                            s.push_output("  /jobs to view · /attach to interact".to_string());
+                            id
+                        };
+
+                        // Spawn output collector
                         let out_state = Arc::clone(&state);
                         tokio::spawn(async move {
                             loop {
@@ -585,8 +622,12 @@ async fn main() -> Result<()> {
                                         match chunk {
                                             Some(data) => {
                                                 let text = String::from_utf8_lossy(&data);
-                                                let mut s = out_state.lock().unwrap();
-                                                s.push_output(format!("  [#{job_id}] {}", text.trim()));
+                                                for line in text.lines() {
+                                                    if !line.is_empty() {
+                                                        let mut s = out_state.lock().unwrap();
+                                                        s.push_output(format!("  \x1b[2m[#{job_id}]\x1b[0m {line}"));
+                                                    }
+                                                }
                                             }
                                             None => break,
                                         }
@@ -595,8 +636,12 @@ async fn main() -> Result<()> {
                                         match chunk {
                                             Some(data) => {
                                                 let text = String::from_utf8_lossy(&data);
-                                                let mut s = out_state.lock().unwrap();
-                                                s.push_output(format!("  [#{job_id}] {}", text.trim()));
+                                                for line in text.lines() {
+                                                    if !line.is_empty() {
+                                                        let mut s = out_state.lock().unwrap();
+                                                        s.push_output(format!("  \x1b[2m[#{job_id}]\x1b[0m {line}"));
+                                                    }
+                                                }
                                             }
                                             None => break,
                                         }
@@ -606,12 +651,10 @@ async fn main() -> Result<()> {
                             // Process exited
                             let code = exit_rx.await.unwrap_or(1);
                             let mut s = out_state.lock().unwrap();
-                            let status = if code == 0 {
-                                app::JobStatus::Done
-                            } else {
-                                app::JobStatus::Failed
-                            };
+                            let status = if code == 0 { app::JobStatus::Done } else { app::JobStatus::Failed };
                             s.update_job(job_id, status, 0);
+                            s.process_writers.remove(&job_id);
+                            s.process_handles.remove(&job_id);
                             s.push_output(format!("🖥 #{job_id} exited (code {code})"));
                         });
                     }
@@ -629,8 +672,7 @@ async fn main() -> Result<()> {
             AppEvent::Detach => {
                 let mut s = state.lock().unwrap();
                 if let Some(pid) = s.attached_process.take() {
-                    s.attached_writer = None;
-                    s.push_output(format!("Detached from process #{pid}"));
+                    s.push_output(format!("Detached from #{pid}"));
                 }
             }
             AppEvent::ProcessInput(_data) => {
