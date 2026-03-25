@@ -12,6 +12,8 @@ mod models;
 mod display;
 mod engine;
 mod session;
+mod spawn_tool;
+mod subagent;
 mod survey_ui;
 mod throbber;
 mod tui;
@@ -417,6 +419,13 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // Create spawn tool for subagents
+                let spawn = Arc::new(spawn_tool::SpawnTool::new(
+                    &target,
+                    Arc::new(Mutex::new(model_id.clone())),
+                    Arc::clone(&state),
+                )) as Arc<dyn llm_code_sdk::Tool>;
+
                 let agent_future = agent::execute(
                     &instruction,
                     &target,
@@ -426,6 +435,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&cancelled),
                     model,
                     effort,
+                    Some(spawn),
                 );
 
                 // Race agent against interrupt events.
