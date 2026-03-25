@@ -16,11 +16,30 @@ mod voice;
 pub const VERSION: &str = "0.1.0";
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use app::{App, AppEvent, AppState, OutputLine};
+use app::{App, AppEvent, AppState};
+
+/// Extract text content from a MessageParam for display purposes.
+fn message_text(msg: &llm_code_sdk::MessageParam) -> String {
+    match &msg.content {
+        llm_code_sdk::MessageContent::Text(s) => s.clone(),
+        llm_code_sdk::MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| {
+                if let llm_code_sdk::ContentBlockParam::Text { text, .. } = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,10 +90,7 @@ async fn main() -> Result<()> {
 
     // Replay resumed conversation into output
     for msg in &conversation {
-        let text = serde_json::to_value(&msg.content)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
+        let text = message_text(msg);
         let mut s = state.lock().unwrap();
         if msg.role == "user" {
             s.push_output(format!("\u{203a} {text}"));
@@ -165,6 +181,19 @@ async fn main() -> Result<()> {
                             s.couch_mode_notify = 30;
                             s.push_output("🎮 Couch mode off".to_string());
                         }
+                        "/clear" => {
+                            drop(s);
+                            let _ = event_tx.send(AppEvent::Clear);
+                        }
+                        "/help" => {
+                            s.push_output("/clear          Clear conversation context and output".to_string());
+                            s.push_output("/usage          Toggle token usage display".to_string());
+                            s.push_output("/model          Toggle model name display".to_string());
+                            s.push_output("/context        Toggle context window display".to_string());
+                            s.push_output("/project        Toggle project path display".to_string());
+                            s.push_output("/couch [on|off] Toggle couch/gamepad mode".to_string());
+                            s.push_output("/help           Show this help".to_string());
+                        }
                         _ => {
                             s.push_output(format!("Unknown command: {instruction}"));
                         }
@@ -181,10 +210,21 @@ async fn main() -> Result<()> {
                     s.throbber_state = 1;
                 }
 
+                // Cancellation flag: set to true when interrupt is received.
+                // The agent callback checks this to avoid processing events after cancel.
+                let cancelled = Arc::new(AtomicBool::new(false));
+
                 // Create agent callback that writes to shared state
                 let cb_state = Arc::clone(&state);
                 let cb_verbose = verbose;
+                let cb_cancelled = Arc::clone(&cancelled);
                 let callback: llm_code_sdk::tools::ToolEventCallback = Arc::new(move |event| {
+                    // If cancellation was requested, ignore this event to avoid
+                    // overwriting the "(interrupted)" message with late results.
+                    if cb_cancelled.load(Ordering::SeqCst) {
+                        return;
+                    }
+
                     let mut s = cb_state.lock().unwrap();
                     match &event {
                         llm_code_sdk::tools::ToolEvent::Text { text } => {
@@ -230,7 +270,13 @@ async fn main() -> Result<()> {
                 });
 
                 let survey_state = Arc::clone(&state);
+                let survey_cancelled = Arc::clone(&cancelled);
                 let survey_cb: llm_code_sdk::tools::SurveyCallback = Arc::new(move |req| {
+                    // If cancelled, return empty response immediately
+                    if survey_cancelled.load(Ordering::SeqCst) {
+                        return llm_code_sdk::tools::SurveyResponse { selected: vec![] };
+                    }
+
                     let (tx, rx) = std::sync::mpsc::channel();
                     {
                         let mut s = survey_state.lock().unwrap();
@@ -254,6 +300,7 @@ async fn main() -> Result<()> {
 
                 let agent_state = Arc::clone(&state);
                 let agent_target = target.clone();
+                let agent_cancelled = Arc::clone(&cancelled);
 
                 let agent_future = agent::execute(
                     &instruction,
@@ -267,12 +314,19 @@ async fn main() -> Result<()> {
                     result = agent_future => {
                         let mut s = agent_state.lock().unwrap();
                         s.agent_active = false;
-                        if let Err(e) = result {
+                        // If cancelled was set, the cancel branch already printed "(interrupted)".
+                        // Don't print error/result over that message.
+                        if agent_cancelled.load(Ordering::SeqCst) {
+                            s.push_output(String::new());
+                        } else if let Err(e) = result {
                             s.push_output(format!("error: {e:#}"));
+                            s.push_output(String::new());
+                        } else {
+                            s.push_output(String::new());
                         }
-                        s.push_output(String::new());
                     }
                     _ = async { cancel_rx.await.ok() } => {
+                        cancelled.store(true, Ordering::SeqCst);
                         let mut s = agent_state.lock().unwrap();
                         s.agent_active = false;
                         s.push_output("(interrupted)".to_string());
@@ -295,6 +349,11 @@ async fn main() -> Result<()> {
                 if let Some(cancel) = agent_cancel.take() {
                     let _ = cancel.send(());
                 }
+            }
+            AppEvent::Clear => {
+                conversation.clear();
+                let mut s = state.lock().unwrap();
+                s.clear();
             }
             AppEvent::VoiceAudio(samples) => {
                 let tx = event_tx.clone();
