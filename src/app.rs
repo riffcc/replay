@@ -497,8 +497,10 @@ pub struct App {
     gilrs: Option<gilrs::Gilrs>,
     /// Start button hold tracking for couch mode toggle.
     start_held_since: Option<std::time::Instant>,
-    /// Back button tracking for voice input.
-    back_last_tap: Option<std::time::Instant>,
+    /// When Select was last pressed (for short-tap vs hold detection).
+    voice_press_time: Option<std::time::Instant>,
+    /// Whether current recording was started by a short tap (toggle mode).
+    voice_toggled: bool,
     /// Active voice capture.
     voice_capture: Option<crate::voice::VoiceCapture>,
     /// Left stick repeat throttle — last time we fired a stick-driven action.
@@ -561,7 +563,8 @@ impl App {
             history_stash: String::new(),
             gilrs: gilrs::Gilrs::new().ok(),
             start_held_since: None,
-            back_last_tap: None,
+            voice_press_time: None,
+            voice_toggled: false,
             voice_capture: None,
             stick_last_action: None,
             stick_prev_y: 0,
@@ -1163,6 +1166,35 @@ fn visual_cursor_position(buffer: &str, cursor: usize, wrap_width: usize) -> (us
 
 impl App {
     /// Poll gamepad events. Collects key codes to process, avoiding borrow conflicts.
+    fn start_voice_recording(&mut self) {
+        match crate::voice::VoiceCapture::start() {
+            Ok(capture) => {
+                self.voice_capture = Some(capture);
+                self.voice_insert_start = Some(self.input_cursor);
+                self.voice_last_transcribe = None;
+                let mut state = self.state.lock().unwrap();
+                state.recording = true;
+            }
+            Err(e) => {
+                let mut state = self.state.lock().unwrap();
+                state.status_message = Some(format!("Voice: {e}"));
+            }
+        }
+    }
+
+    fn stop_voice_recording(&mut self) {
+        if let Some(capture) = self.voice_capture.take() {
+            let audio = capture.stop();
+            let mut state = self.state.lock().unwrap();
+            state.recording = false;
+
+            if audio.samples.len() >= 24_000 {
+                let _ = self.event_tx.send(AppEvent::VoiceAudio(audio.samples));
+            }
+            self.voice_last_transcribe = None;
+        }
+    }
+
     fn poll_gamepad(&mut self) {
         let Some(gp) = &mut self.gilrs else { return };
 
@@ -1170,16 +1202,21 @@ impl App {
         let mut actions: Vec<KeyCode> = Vec::new();
         let mut start_pressed = false;
         let mut start_released = false;
+        let mut select_pressed = false;
+        let mut select_released = false;
+        let mut west_pressed = false;
 
         while let Some(event) = gp.next_event() {
             match event.event {
                 gilrs::EventType::ButtonPressed(gilrs::Button::Start, _) => start_pressed = true,
                 gilrs::EventType::ButtonReleased(gilrs::Button::Start, _) => start_released = true,
+                gilrs::EventType::ButtonPressed(gilrs::Button::Select, _) => select_pressed = true,
+                gilrs::EventType::ButtonReleased(gilrs::Button::Select, _) => select_released = true,
                 gilrs::EventType::ButtonPressed(gilrs::Button::DPadUp, _) => actions.push(KeyCode::Up),
                 gilrs::EventType::ButtonPressed(gilrs::Button::DPadDown, _) => actions.push(KeyCode::Down),
                 gilrs::EventType::ButtonPressed(gilrs::Button::South, _) => actions.push(KeyCode::Enter),
                 gilrs::EventType::ButtonPressed(gilrs::Button::East, _) => actions.push(KeyCode::Esc),
-                gilrs::EventType::ButtonPressed(gilrs::Button::West, _) => actions.push(KeyCode::Char(' ')),
+                gilrs::EventType::ButtonPressed(gilrs::Button::West, _) => west_pressed = true,
                 gilrs::EventType::ButtonPressed(gilrs::Button::LeftTrigger, _) => actions.push(KeyCode::PageUp),
                 gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => actions.push(KeyCode::PageDown),
                 _ => {}
@@ -1251,64 +1288,79 @@ impl App {
             }
         }
 
-        // Handle Back button for voice input (Select button on many controllers)
-        if let Some(gp) = &self.gilrs {
-            for (_id, gamepad) in gp.gamepads() {
-                if gamepad.is_pressed(gilrs::Button::Select) {
-                    if self.voice_capture.is_none() {
-                        // Start recording
-                        match crate::voice::VoiceCapture::start() {
-                            Ok(capture) => {
-                                self.voice_capture = Some(capture);
-                                self.voice_insert_start = Some(self.input_cursor);
-                                self.voice_last_transcribe = None;
-                                let mut state = self.state.lock().unwrap();
-                                state.recording = true;
-                            }
-                            Err(e) => {
-                                let mut state = self.state.lock().unwrap();
-                                state.status_message = Some(format!("Voice: {e}"));
-                            }
-                        }
-                    } else {
-                        // Update VU meter + send streaming transcription chunks
-                        if let Some(capture) = &self.voice_capture {
-                            let peak = capture.peak();
-                            let mut state = self.state.lock().unwrap();
-                            state.voice_meter.update(peak);
+        // Handle Select button for voice input.
+        // - Hold: push-to-talk, release stops recording.
+        // - Short tap (<300ms) + release: toggle mode, stays recording until next tap.
+        const SHORT_TAP_MS: u128 = 300;
 
-                            // Send streaming chunk every 2 seconds
-                            let should_transcribe = self.voice_last_transcribe
-                                .map(|t| t.elapsed().as_secs() >= 2)
-                                .unwrap_or_else(|| {
-                                    // First chunk after 2s of recording
-                                    capture.duration_samples() >= 48_000
-                                });
-                            if should_transcribe {
-                                let samples = capture.samples_snapshot();
-                                if samples.len() >= 24_000 {
-                                    let _ = self.event_tx.send(AppEvent::VoiceAudio(samples));
-                                    self.voice_last_transcribe = Some(std::time::Instant::now());
-                                }
-                            }
-                        }
-                    }
-                } else if self.voice_capture.is_some() && !gamepad.is_pressed(gilrs::Button::Select) {
-                    // Released — stop and do final transcription
-                    if let Some(capture) = self.voice_capture.take() {
-                        let audio = capture.stop();
-                        let mut state = self.state.lock().unwrap();
-                        state.recording = false;
+        if select_pressed {
+            if self.voice_capture.is_some() && self.voice_toggled {
+                // In toggle mode — tap stops recording
+                self.stop_voice_recording();
+            } else if self.voice_capture.is_none() {
+                // Start recording, remember when we pressed
+                self.voice_press_time = Some(std::time::Instant::now());
+                self.voice_toggled = false;
+                self.start_voice_recording();
+            }
+        }
 
-                        if audio.samples.len() >= 24_000 { // at least 0.5s
-                            let _ = self.event_tx.send(AppEvent::VoiceAudio(audio.samples));
-                        }
-                        // Clear voice region tracking after final transcription is sent
-                        // (the pending_insert handler will do one last replacement)
-                        self.voice_last_transcribe = None;
-                        // Note: voice_insert_start is cleared when the user types or moves cursor
-                    }
+        if select_released && !select_pressed && self.voice_capture.is_some() && !self.voice_toggled {
+            // Released while recording in PTT mode
+            let was_short_tap = self.voice_press_time
+                .map(|t| t.elapsed().as_millis() < SHORT_TAP_MS)
+                .unwrap_or(false);
+
+            if was_short_tap {
+                // Short tap — promote to toggle mode, keep recording
+                self.voice_toggled = true;
+            } else {
+                // Long hold — PTT, stop recording
+                self.stop_voice_recording();
+            }
+        }
+
+        // Update VU meter + streaming transcription while recording
+        if let Some(capture) = &self.voice_capture {
+            let peak = capture.peak();
+            let mut state = self.state.lock().unwrap();
+            state.voice_meter.update(peak);
+
+            let should_transcribe = self.voice_last_transcribe
+                .map(|t| t.elapsed().as_secs() >= 2)
+                .unwrap_or_else(|| capture.duration_samples() >= 48_000);
+            if should_transcribe {
+                let samples = capture.samples_snapshot();
+                if samples.len() >= 24_000 {
+                    let _ = self.event_tx.send(AppEvent::VoiceAudio(samples));
+                    self.voice_last_transcribe = Some(std::time::Instant::now());
                 }
+            }
+        }
+
+        // Handle West (X) button: word-backspace in input, Space in survey
+        if west_pressed {
+            let has_survey = self.state.lock().unwrap().pending_survey.is_some();
+            if has_survey {
+                actions.push(KeyCode::Char(' '));
+            } else if self.input_cursor > 0 {
+                // Delete the word before cursor
+                let buf = &self.input_buffer[..self.input_cursor];
+                // Skip trailing whitespace, then skip the word
+                let end = self.input_cursor;
+                let trimmed = buf.trim_end();
+                let word_start = trimmed.rfind(|c: char| c.is_whitespace())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                // Find the byte position accounting for whitespace we skipped
+                let delete_start = if trimmed.len() < buf.len() {
+                    // There was trailing whitespace — delete from word_start
+                    word_start
+                } else {
+                    word_start
+                };
+                self.input_buffer.replace_range(delete_start..end, "");
+                self.input_cursor = delete_start;
             }
         }
 
