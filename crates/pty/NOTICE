@@ -1,0 +1,12 @@
+This crate is vendored from codex-utils-pty, part of the OpenAI Codex project.
+
+Original source: https://github.com/openai/codex
+Original crate path: codex-rs/utils/pty
+Original license: Apache-2.0
+
+Vendored into Replay with modifications:
+- Renamed to replay-pty
+- Removed workspace dependency references
+- Standalone Cargo.toml
+
+All original copyright remains with OpenAI.
