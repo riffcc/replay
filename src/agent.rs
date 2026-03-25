@@ -62,9 +62,14 @@ Respond with a brief summary of what you changed and why."#,
 
 /// Create the tool set for the agent.
 fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>, survey_callback: llm_code_sdk::tools::SurveyCallback) -> Vec<Arc<dyn Tool>> {
+    // Shared read tracker enforces read-before-write
+    let tracker = llm_code_sdk::tools::smart::ReadTracker::new();
+    let reader = SmartReadTool::with_tracker(project_root, tracker.clone());
+    let writer = SmartWriteTool::with_tracker(project_root, tracker);
+
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SmartReadTool::new(project_root)),
-        Arc::new(SmartWriteTool::new(project_root)),
+        Arc::new(reader),
+        Arc::new(writer),
         Arc::new(BashTool::new(project_root)),
         Arc::new(GlobTool::new(project_root)),
         Arc::new(GrepTool::new(project_root)),
@@ -164,7 +169,7 @@ pub async fn execute(
 
     let params = MessageCreateParams {
         model: MODEL.into(),
-        max_tokens: 8192,
+        max_tokens: 32000,
         messages: history.clone(),
         system,
         ..Default::default()
@@ -229,7 +234,7 @@ pub async fn solve(issue: &Issue, project_root: &Path) -> Result<String> {
 
     let params = MessageCreateParams {
         model: MODEL.into(),
-        max_tokens: 8192,
+        max_tokens: 32000,
         messages: vec![MessageParam::user("Solve this issue.")],
         system: Some(SystemPrompt::Text(system_prompt(issue, project_root))),
         ..Default::default()

@@ -9,6 +9,8 @@ use std::sync::Mutex;
 
 use llm_code_sdk::tools::ToolEvent;
 
+use crate::throbber::Throbber;
+
 /// ANSI color codes.
 const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
