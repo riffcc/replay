@@ -276,8 +276,11 @@ async fn main() -> Result<()> {
                             let _ = event_tx.send(AppEvent::Clear);
                         }
                         "/ps" | "/jobs" => {
-                            let ps = s.format_ps();
-                            s.push_output(ps);
+                            if s.jobs.is_empty() {
+                                s.push_output("No background terminals.".to_string());
+                            } else {
+                                s.job_browser = Some(app::JobBrowser::new());
+                            }
                         }
                         "/clean" => {
                             let removed = s.jobs.iter().filter(|j| j.status != app::JobStatus::Running).count();

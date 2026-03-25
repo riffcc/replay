@@ -250,6 +250,38 @@ pub enum JobStatus {
     Failed,
 }
 
+/// Job browser view mode.
+#[derive(Clone, PartialEq)]
+pub enum JobBrowserMode {
+    /// Browsing the job list.
+    List,
+    /// Viewing a job's output (read-only).
+    ViewOutput(u32),
+    /// Context menu on a job.
+    ContextMenu(u32, usize), // job_id, menu cursor
+}
+
+/// State for the interactive job browser.
+#[derive(Clone)]
+pub struct JobBrowser {
+    pub mode: JobBrowserMode,
+    pub cursor: usize,
+    /// Timestamp when A was first pressed (for hold-to-attach).
+    pub a_held_since: Option<std::time::Instant>,
+}
+
+impl JobBrowser {
+    pub fn new() -> Self {
+        Self {
+            mode: JobBrowserMode::List,
+            cursor: 0,
+            a_held_since: None,
+        }
+    }
+}
+
+const JOB_CONTEXT_MENU: [&str; 3] = ["Attach (interactive)", "Stop", "Set Timeout"];
+
 impl std::fmt::Display for JobStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -347,9 +379,11 @@ pub struct AppState {
     pub voice_meter: VoiceMeter,
     /// Agent survey (from SDK SurveyTool).
     pub pending_survey: Option<PendingSurvey>,
-    /// Active jobs (subagents).
+    /// Active jobs (subagents / background terminals).
     pub jobs: Vec<JobInfo>,
     next_job_id: u32,
+    /// Job browser state (None = not browsing).
+    pub job_browser: Option<JobBrowser>,
     /// Attached to a background terminal (process ID). Keystrokes forwarded.
     pub attached_process: Option<u32>,
     /// Writer channel for attached process.
@@ -393,6 +427,7 @@ impl AppState {
             pending_survey: None,
             jobs: Vec::new(),
             next_job_id: 1,
+            job_browser: None,
             attached_process: None,
             attached_writer: None,
             active_menu: None,
@@ -847,7 +882,7 @@ impl App {
                 }
 
                 // Survey and menu input take priority
-                if self.handle_survey_key(key.code) || self.handle_menu_key(key.code) {
+                if self.handle_job_browser_key(key.code) || self.handle_survey_key(key.code) || self.handle_menu_key(key.code) {
                     continue;
                 }
 
@@ -1091,6 +1126,90 @@ impl App {
                 all_lines.push(Line::from(spans.clone()));
             } else {
                 all_lines.push(Line::raw(&line.content));
+            }
+        }
+
+        // Render job browser if open
+        if let Some(browser) = &state.job_browser {
+            all_lines.push(Line::raw(""));
+            match &browser.mode {
+                JobBrowserMode::List => {
+                    all_lines.push(Line::styled(
+                        "  Background terminals",
+                        Style::default().fg(Color::White).bold(),
+                    ));
+                    all_lines.push(Line::raw(""));
+                    for (i, job) in state.jobs.iter().enumerate() {
+                        let at_cursor = i == browser.cursor;
+                        let elapsed = job.started.elapsed().as_secs();
+                        let icon = match job.status {
+                            JobStatus::Running => "◐",
+                            JobStatus::Done => "✔",
+                            JobStatus::Failed => "✗",
+                        };
+                        let status_text = match job.status {
+                            JobStatus::Running => format!("Running, {elapsed}s"),
+                            JobStatus::Done => format!("Success, ran for {elapsed}s"),
+                            JobStatus::Failed => format!("Failed, after {elapsed}s"),
+                        };
+                        let arrow = if at_cursor { "\u{203a}" } else { " " };
+                        let label_color = if at_cursor { Color::Cyan } else { Color::White };
+                        let status_color = if at_cursor { Color::Cyan } else { Color::DarkGray };
+
+                        all_lines.push(Line::from(vec![
+                            Span::raw(format!("  {arrow} {icon} ")),
+                            Span::styled(&job.task, Style::default().fg(label_color)),
+                            Span::styled(format!(" ({status_text})"), Style::default().fg(status_color)),
+                        ]));
+                    }
+                    all_lines.push(Line::raw(""));
+                    all_lines.push(Line::styled(
+                        "  Enter: view output · Tab/X: actions · Esc: close",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                JobBrowserMode::ViewOutput(job_id) => {
+                    if let Some(job) = state.jobs.iter().find(|j| j.id == *job_id) {
+                        all_lines.push(Line::styled(
+                            format!("  Output: {} (#{job_id})", job.task),
+                            Style::default().fg(Color::Cyan).bold(),
+                        ));
+                        all_lines.push(Line::raw(""));
+                        // TODO: show buffered output from the process
+                        all_lines.push(Line::styled(
+                            "  (output streaming not yet wired)",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    all_lines.push(Line::raw(""));
+                    all_lines.push(Line::styled(
+                        "  Esc: back to list",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                JobBrowserMode::ContextMenu(job_id, menu_cursor) => {
+                    if let Some(job) = state.jobs.iter().find(|j| j.id == *job_id) {
+                        all_lines.push(Line::styled(
+                            format!("  {} (#{job_id})", job.task),
+                            Style::default().fg(Color::White).bold(),
+                        ));
+                    }
+                    all_lines.push(Line::raw(""));
+                    for (i, option) in JOB_CONTEXT_MENU.iter().enumerate() {
+                        let at_cursor = i == *menu_cursor;
+                        let arrow = if at_cursor { "\u{203a}" } else { " " };
+                        let color = if at_cursor { Color::Cyan } else { Color::White };
+                        all_lines.push(Line::from(Span::styled(
+                            format!("  {arrow} {option}"),
+                            Style::default().fg(color),
+                        )));
+                    }
+                    all_lines.push(Line::raw(""));
+                    all_lines.push(Line::styled(
+                        "  Enter: select · Esc: back",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
         }
 
@@ -1687,7 +1806,7 @@ impl App {
 
         // Process collected actions
         for code in actions {
-            if self.handle_survey_key(code) || self.handle_menu_key(code) {
+            if self.handle_job_browser_key(code) || self.handle_survey_key(code) || self.handle_menu_key(code) {
                 continue;
             }
 
@@ -1721,6 +1840,111 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// Handle a key for the job browser. Returns true if consumed.
+    fn handle_job_browser_key(&mut self, code: KeyCode) -> bool {
+        let mut state = self.state.lock().unwrap();
+
+        // Extract browser state to avoid borrow conflicts
+        let (mode, cursor) = match &state.job_browser {
+            Some(b) => (b.mode.clone(), b.cursor),
+            None => return false,
+        };
+
+        let job_count = state.jobs.len();
+        if job_count == 0 {
+            state.job_browser = None;
+            return true;
+        }
+
+        match &mode {
+            JobBrowserMode::List => {
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let new_cursor = if cursor == 0 { job_count - 1 } else { cursor - 1 };
+                        state.job_browser.as_mut().unwrap().cursor = new_cursor;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let new_cursor = (cursor + 1) % job_count;
+                        state.job_browser.as_mut().unwrap().cursor = new_cursor;
+                    }
+                    KeyCode::Enter => {
+                        // A / Enter: view output
+                        if cursor < state.jobs.len() {
+                            let job_id = state.jobs[cursor].id;
+                            state.job_browser.as_mut().unwrap().mode = JobBrowserMode::ViewOutput(job_id);
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Char('x') => {
+                        // X / Tab: context menu
+                        if cursor < state.jobs.len() {
+                            let job_id = state.jobs[cursor].id;
+                            state.job_browser.as_mut().unwrap().mode = JobBrowserMode::ContextMenu(job_id, 0);
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('b') => {
+                        // B / Esc: close browser
+                        state.job_browser = None;
+                    }
+                    _ => {}
+                }
+            }
+            JobBrowserMode::ViewOutput(job_id) => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('b') => {
+                        // B / Esc: back to list
+                        state.job_browser.as_mut().unwrap().mode = JobBrowserMode::List;
+                    }
+                    _ => {}
+                }
+            }
+            JobBrowserMode::ContextMenu(job_id, menu_cursor) => {
+                let job_id = *job_id;
+                let menu_cursor = *menu_cursor;
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let new_cursor = if menu_cursor == 0 { JOB_CONTEXT_MENU.len() - 1 } else { menu_cursor - 1 };
+                        state.job_browser.as_mut().unwrap().mode = JobBrowserMode::ContextMenu(job_id, new_cursor);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let new_cursor = (menu_cursor + 1) % JOB_CONTEXT_MENU.len();
+                        state.job_browser.as_mut().unwrap().mode = JobBrowserMode::ContextMenu(job_id, new_cursor);
+                    }
+                    KeyCode::Enter => {
+                        match menu_cursor {
+                            0 => {
+                                // Attach (interactive)
+                                state.attached_process = Some(job_id);
+                                state.job_browser = None;
+                                state.push_output(format!("Attached to #{job_id}. Esc or Ctrl-D to detach."));
+                            }
+                            1 => {
+                                // Stop
+                                if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
+                                    job.status = JobStatus::Failed;
+                                }
+                                state.push_output(format!("Stopped #{job_id}"));
+                                state.job_browser.as_mut().unwrap().mode = JobBrowserMode::List;
+                                // TODO: actually kill the process via process manager
+                            }
+                            2 => {
+                                // Set Timeout — for now just show a message
+                                state.push_output(format!("Set Timeout for #{job_id} (not yet implemented)"));
+                                state.job_browser.as_mut().unwrap().mode = JobBrowserMode::List;
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('b') => {
+                        // Back to list
+                        state.job_browser.as_mut().unwrap().mode = JobBrowserMode::List;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
     }
 
     /// Handle a key for the agent's survey. Returns true if consumed.
