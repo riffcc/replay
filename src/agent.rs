@@ -96,6 +96,9 @@ fn create_tools(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>
 fn build_system_prompt(project_root: &Path, skill_registry: &Arc<RwLock<SkillRegistry>>) -> Option<String> {
     let mut parts = Vec::new();
 
+    // Working directory context
+    parts.push(format!("Working directory: {}", project_root.display()));
+
     // AGENTS.md at project root — always included directly
     let agents_md = project_root.join("AGENTS.md");
     if agents_md.exists() {
