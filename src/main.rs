@@ -1,6 +1,7 @@
 //! Replay — self-improving software orchestration.
 
 mod agent;
+mod ansi;
 mod app;
 mod beads;
 mod markdown;
@@ -10,6 +11,7 @@ mod session;
 mod survey_ui;
 mod throbber;
 mod tui;
+mod voice;
 
 pub const VERSION: &str = "0.1.0";
 
@@ -153,6 +155,16 @@ async fn main() -> Result<()> {
                         "/project" => {
                             s.show_project = !s.show_project;
                         }
+                        "/couch" | "/couch on" => {
+                            s.couch_mode = true;
+                            s.couch_mode_notify = 30;
+                            s.push_output("🎮 Couch mode on".to_string());
+                        }
+                        "/couch off" => {
+                            s.couch_mode = false;
+                            s.couch_mode_notify = 30;
+                            s.push_output("🎮 Couch mode off".to_string());
+                        }
                         _ => {
                             s.push_output(format!("Unknown command: {instruction}"));
                         }
@@ -200,9 +212,9 @@ async fn main() -> Result<()> {
                         llm_code_sdk::tools::ToolEvent::ToolResult { name, success, output } => {
                             s.throbber_state = 1;
                             let icon = if *success { "\x1b[32m●\x1b[0m" } else { "\x1b[31m●\x1b[0m" };
-                            // For tasks, show the formatted output as markdown
+                            // For tasks, show the ANSI-styled output
                             if *name == "tasks" && !output.is_empty() {
-                                s.push_markdown(output.clone());
+                                s.push_ansi(output.clone());
                             }
                             if cb_verbose {
                                 s.push_output(format!("  {icon} {name} output: {output}"));
@@ -282,6 +294,28 @@ async fn main() -> Result<()> {
             AppEvent::Interrupt => {
                 if let Some(cancel) = agent_cancel.take() {
                     let _ = cancel.send(());
+                }
+            }
+            AppEvent::VoiceAudio(samples) => {
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    match voice::transcribe(&samples).await {
+                        Ok(text) => { let _ = tx.send(AppEvent::VoiceTranscription(text)); }
+                        Err(e) => { let _ = tx.send(AppEvent::VoiceTranscription(format!("(error: {e})"))); }
+                    }
+                });
+            }
+            AppEvent::VoiceTranscription(text) => {
+                if text.starts_with("(error:") {
+                    let mut s = state.lock().unwrap();
+                    s.push_output(text);
+                } else if !text.is_empty() {
+                    // Insert transcribed text into the input (or submit if in couch mode)
+                    let mut s = state.lock().unwrap();
+                    s.push_output(format!("\u{1F3A4} \"{text}\""));
+                    drop(s);
+                    // Re-inject as a submit event
+                    let _ = event_tx.send(AppEvent::Submit(text));
                 }
             }
             AppEvent::Quit => {

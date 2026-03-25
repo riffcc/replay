@@ -100,6 +100,64 @@ fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     result
 }
 
+/// Voice VU meter — Codex-style braille visualization.
+pub struct VoiceMeter {
+    history: std::collections::VecDeque<char>,
+    noise_ema: f64,
+    env: f64,
+}
+
+const VU_SYMBOLS: [char; 7] = ['⠤', '⠴', '⠶', '⠷', '⡷', '⡿', '⣿'];
+
+impl VoiceMeter {
+    pub fn new() -> Self {
+        let mut history = std::collections::VecDeque::with_capacity(4);
+        for _ in 0..4 {
+            history.push_back('⠤');
+        }
+        Self {
+            history,
+            noise_ema: 0.02,
+            env: 0.0,
+        }
+    }
+
+    /// Feed a peak level (0.0 - 1.0) and get the 4-char braille string.
+    pub fn update(&mut self, peak: f32) -> String {
+        const ALPHA_NOISE: f64 = 0.05;
+        const ATTACK: f64 = 0.80;
+        const RELEASE: f64 = 0.25;
+
+        let latest_peak = peak as f64;
+
+        if latest_peak > self.env {
+            self.env = ATTACK * latest_peak + (1.0 - ATTACK) * self.env;
+        } else {
+            self.env = RELEASE * latest_peak + (1.0 - RELEASE) * self.env;
+        }
+
+        let rms_approx = self.env * 0.7;
+        self.noise_ema = (1.0 - ALPHA_NOISE) * self.noise_ema + ALPHA_NOISE * rms_approx;
+        let ref_level = self.noise_ema.max(0.01);
+        let fast_signal = 0.8 * latest_peak + 0.2 * self.env;
+        let target = 2.0f64;
+        let raw = (fast_signal / (ref_level * target)).max(0.0);
+        let k = 1.6f64;
+        let compressed = (raw.ln_1p() / k.ln_1p()).min(1.0);
+        let idx = (compressed * (VU_SYMBOLS.len() as f64 - 1.0))
+            .round()
+            .clamp(0.0, VU_SYMBOLS.len() as f64 - 1.0) as usize;
+        let level_char = VU_SYMBOLS[idx];
+
+        if self.history.len() >= 4 {
+            self.history.pop_front();
+        }
+        self.history.push_back(level_char);
+
+        self.history.iter().collect()
+    }
+}
+
 /// A survey waiting for user input.
 pub struct PendingSurvey {
     pub prompt: String,
@@ -115,6 +173,7 @@ pub struct PendingSurvey {
 enum RawEntry {
     Plain(String),
     Markdown(String),
+    Ansi(String),
 }
 
 /// State shared between the TUI and the agent.
@@ -151,6 +210,14 @@ pub struct AppState {
     pub project_path: String,
     /// Context window size (for percentage calculation).
     pub context_window: u64,
+    /// Couch mode — gamepad-friendly, surveys for all input.
+    pub couch_mode: bool,
+    /// Couch mode notification countdown (frames remaining).
+    pub couch_mode_notify: u8,
+    /// Voice recording active.
+    pub recording: bool,
+    /// Voice meter state (Codex-style braille VU).
+    pub voice_meter: VoiceMeter,
     /// Pending survey for the user to answer.
     pub pending_survey: Option<PendingSurvey>,
     /// Token rate tracking for animation.
@@ -180,6 +247,10 @@ impl AppState {
             show_model: false,
             show_context: true,
             show_project: true,
+            couch_mode: false,
+            couch_mode_notify: 0,
+            recording: false,
+            voice_meter: VoiceMeter::new(),
             pending_survey: None,
             model_name: String::new(),
             project_path: String::new(),
@@ -195,6 +266,22 @@ impl AppState {
         self.raw_output.push(RawEntry::Plain(content.clone()));
         for line in wrap_text(&content, self.term_width) {
             self.output.push(OutputLine { content: line, styled: None });
+        }
+        self.scroll_offset = 0;
+    }
+
+    /// Push ANSI-colored content — parses escape codes into styled spans.
+    pub fn push_ansi(&mut self, content: String) {
+        self.raw_output.push(RawEntry::Ansi(content.clone()));
+        let styled_lines = crate::ansi::parse_to_lines(&content);
+        for line in styled_lines {
+            for wrapped in wrap_styled_line(&line, self.term_width) {
+                let plain: String = wrapped.spans.iter().map(|s| s.content.as_ref()).collect();
+                self.output.push(OutputLine {
+                    content: plain,
+                    styled: Some(wrapped.spans),
+                });
+            }
         }
         self.scroll_offset = 0;
     }
@@ -267,6 +354,18 @@ impl AppState {
                         }
                     }
                 }
+                RawEntry::Ansi(text) => {
+                    let styled_lines = crate::ansi::parse_to_lines(text);
+                    for line in styled_lines {
+                        for wrapped in wrap_styled_line(&line, new_width) {
+                            let plain: String = wrapped.spans.iter().map(|s| s.content.as_ref()).collect();
+                            self.output.push(OutputLine {
+                                content: plain,
+                                styled: Some(wrapped.spans),
+                            });
+                        }
+                    }
+                }
             }
         }
         self.scroll_offset = 0;
@@ -281,6 +380,10 @@ pub enum AppEvent {
     Quit,
     /// User double-entered to interrupt.
     Interrupt,
+    /// Voice audio captured, needs transcription (runs in async context).
+    VoiceAudio(Vec<f32>),
+    /// Voice transcription completed.
+    VoiceTranscription(String),
 }
 
 /// The TUI application.
@@ -297,6 +400,14 @@ pub struct App {
     history_index: Option<usize>,
     /// Saved current input when browsing history.
     history_stash: String,
+    /// Gamepad support.
+    gilrs: Option<gilrs::Gilrs>,
+    /// Start button hold tracking for couch mode toggle.
+    start_held_since: Option<std::time::Instant>,
+    /// Back button tracking for voice input.
+    back_last_tap: Option<std::time::Instant>,
+    /// Active voice capture.
+    voice_capture: Option<crate::voice::VoiceCapture>,
 }
 
 const DOUBLE_ENTER_MS: u64 = 300;
@@ -325,6 +436,10 @@ impl App {
             history: Vec::new(),
             history_index: None,
             history_stash: String::new(),
+            gilrs: gilrs::Gilrs::new().ok(),
+            start_held_since: None,
+            back_last_tap: None,
+            voice_capture: None,
         }
     }
 
@@ -342,7 +457,13 @@ impl App {
                     state.throbber_frame = (state.throbber_frame + 1) % 8;
                 }
                 state.tick_tokens();
+                if state.couch_mode_notify > 0 {
+                    state.couch_mode_notify -= 1;
+                }
             }
+
+            // Poll gamepad
+            self.poll_gamepad();
 
             terminal.draw(|frame| self.render(frame))?;
 
@@ -661,8 +782,14 @@ impl App {
         let status_area = chunks[2];
         let mut status_parts: Vec<Span> = Vec::new();
 
-        // Throbber or status message (left side)
-        if state.agent_active {
+        // Left side: recording meter > throbber > status message
+        if state.recording {
+            let meter: String = state.voice_meter.history.iter().collect();
+            status_parts.push(Span::styled(
+                format!(" \u{1F3A4} {meter} recording "),
+                Style::default().fg(Color::Red),
+            ));
+        } else if state.agent_active {
             let frame_idx = state.throbber_frame as usize % THROBBER_FRAMES.len();
             let chars = &THROBBER_FRAMES[frame_idx];
             status_parts.push(Span::styled(
@@ -680,6 +807,11 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         let sep = Span::styled(" · ", dim);
         let mut right_spans: Vec<Span> = Vec::new();
+
+        if state.couch_mode {
+            right_spans.push(Span::styled("🎮", Style::default()));
+            right_spans.push(sep.clone());
+        }
 
         if state.show_model && !state.model_name.is_empty() {
             right_spans.push(Span::styled(state.model_name.clone(), dim));
@@ -802,6 +934,135 @@ fn cursor_position(buffer: &str, cursor: usize) -> (usize, usize) {
 }
 
 impl App {
+    /// Poll gamepad events. Collects key codes to process, avoiding borrow conflicts.
+    fn poll_gamepad(&mut self) {
+        let Some(gp) = &mut self.gilrs else { return };
+
+        // Collect events into a local vec to avoid borrow issues
+        let mut actions: Vec<KeyCode> = Vec::new();
+        let mut start_pressed = false;
+        let mut start_released = false;
+
+        while let Some(event) = gp.next_event() {
+            match event.event {
+                gilrs::EventType::ButtonPressed(gilrs::Button::Start, _) => start_pressed = true,
+                gilrs::EventType::ButtonReleased(gilrs::Button::Start, _) => start_released = true,
+                gilrs::EventType::ButtonPressed(gilrs::Button::DPadUp, _) => actions.push(KeyCode::Up),
+                gilrs::EventType::ButtonPressed(gilrs::Button::DPadDown, _) => actions.push(KeyCode::Down),
+                gilrs::EventType::ButtonPressed(gilrs::Button::South, _) => actions.push(KeyCode::Enter),
+                gilrs::EventType::ButtonPressed(gilrs::Button::East, _) => actions.push(KeyCode::Esc),
+                gilrs::EventType::ButtonPressed(gilrs::Button::West, _) => actions.push(KeyCode::Char(' ')),
+                gilrs::EventType::ButtonPressed(gilrs::Button::LeftTrigger, _) => actions.push(KeyCode::PageUp),
+                gilrs::EventType::ButtonPressed(gilrs::Button::RightTrigger, _) => actions.push(KeyCode::PageDown),
+                _ => {}
+            }
+        }
+
+        // Handle Start button hold for couch mode
+        if start_pressed {
+            self.start_held_since = Some(std::time::Instant::now());
+        }
+        if start_released {
+            self.start_held_since = None;
+        }
+
+        if let Some(since) = self.start_held_since {
+            if since.elapsed().as_millis() >= 2500 {
+                self.start_held_since = None;
+                let mut state = self.state.lock().unwrap();
+                state.couch_mode = !state.couch_mode;
+                state.couch_mode_notify = 30;
+                if state.couch_mode {
+                    state.push_output("\u{1F3AE} Couch mode on".to_string());
+                } else {
+                    state.push_output("\u{1F3AE} Couch mode off".to_string());
+                }
+            }
+        }
+
+        // Handle Back button for voice input (Select button on many controllers)
+        if let Some(gp) = &self.gilrs {
+            for (_id, gamepad) in gp.gamepads() {
+                if gamepad.is_pressed(gilrs::Button::Select) {
+                    if self.voice_capture.is_none() {
+                        // Start recording
+                        match crate::voice::VoiceCapture::start() {
+                            Ok(capture) => {
+                                self.voice_capture = Some(capture);
+                                let mut state = self.state.lock().unwrap();
+                                state.recording = true;
+                                state.push_output("\u{1F3A4} Recording...".to_string());
+                            }
+                            Err(e) => {
+                                let mut state = self.state.lock().unwrap();
+                                state.push_output(format!("Voice error: {e}"));
+                            }
+                        }
+                    } else {
+                        // Update VU meter while recording
+                        if let Some(capture) = &self.voice_capture {
+                            let peak = capture.peak();
+                            let mut state = self.state.lock().unwrap();
+                            state.voice_meter.update(peak);
+                        }
+                    }
+                } else if self.voice_capture.is_some() && !gamepad.is_pressed(gilrs::Button::Select) {
+                    // Released — stop and transcribe
+                    if let Some(capture) = self.voice_capture.take() {
+                        let audio = capture.stop();
+                        let mut state = self.state.lock().unwrap();
+                        state.recording = false;
+
+                        if audio.samples.len() < 12_000 { // less than 0.5s
+                            state.push_output("(too short to transcribe)".to_string());
+                        } else {
+                            state.push_output("\u{1F3A4} Transcribing...".to_string());
+                            let _ = self.event_tx.send(AppEvent::VoiceAudio(audio.samples));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process collected actions
+        for code in actions {
+            // Try survey first
+            if self.handle_survey_key(code) {
+                continue;
+            }
+
+            match code {
+                KeyCode::Enter => {
+                    if !self.input_buffer.is_empty() {
+                        let line = self.input_buffer.clone();
+                        self.history.push(line.clone());
+                        self.history_index = None;
+                        self.input_buffer.clear();
+                        self.input_cursor = 0;
+                        let _ = self.event_tx.send(AppEvent::Submit(line));
+                    }
+                }
+                KeyCode::Esc => {
+                    let state = self.state.lock().unwrap();
+                    if state.agent_active {
+                        drop(state);
+                        let _ = self.event_tx.send(AppEvent::Interrupt);
+                    }
+                }
+                KeyCode::PageUp => {
+                    let mut state = self.state.lock().unwrap();
+                    let max_scroll = state.output.len().saturating_sub(1);
+                    state.scroll_offset = (state.scroll_offset + 5).min(max_scroll);
+                }
+                KeyCode::PageDown => {
+                    let mut state = self.state.lock().unwrap();
+                    state.scroll_offset = state.scroll_offset.saturating_sub(5);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Handle a key press for a pending survey. Returns true if consumed.
     fn handle_survey_key(&mut self, code: KeyCode) -> bool {
         let mut state = self.state.lock().unwrap();
