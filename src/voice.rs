@@ -1,17 +1,26 @@
-//! Voice input — audio capture and transcription.
+//! Voice input — audio capture and local transcription via Parakeet V3.
 //!
-//! Uses CPAL for microphone capture, outputs 24kHz mono PCM.
-//! Transcribes via chunked silence detection for real-time results.
-//! Backend: Parakeet locally (if available), falls back to Whisper API.
+//! Uses CPAL for microphone capture (24kHz mono PCM).
+//! Transcription via Parakeet V3 INT8 model (downloaded from blob.handy.computer).
+//! No API key needed — runs entirely locally.
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use flate2::read::GzDecoder;
+use tar::Archive;
+use transcribe_rs::TranscriptionEngine;
+use transcribe_rs::engines::parakeet::{
+    ParakeetEngine, ParakeetInferenceParams, ParakeetModelParams, TimestampGranularity,
+};
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
-const SILENCE_THRESHOLD: f32 = 0.01;
-const MIN_CHUNK_SAMPLES: usize = TARGET_SAMPLE_RATE as usize / 2; // 0.5 seconds minimum
+const LOCAL_VOICE_MODEL_DIRNAME: &str = "parakeet-tdt-0.6b-v3-int8";
+const LOCAL_VOICE_MODEL_URL: &str = "https://blob.handy.computer/parakeet-v3-int8.tar.gz";
+
+// ── Audio capture ──
 
 /// Audio capture handle.
 pub struct VoiceCapture {
@@ -53,7 +62,6 @@ impl VoiceCapture {
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if stopped_clone.load(Ordering::Relaxed) { return; }
                         let mut buf = samples_clone.lock().unwrap();
-                        // Take first channel only (mono)
                         for chunk in data.chunks(channels as usize) {
                             if let Some(&sample) = chunk.first() {
                                 buf.push(sample);
@@ -102,7 +110,6 @@ impl VoiceCapture {
 
         let raw_samples = self.samples.lock().unwrap().clone();
 
-        // Resample to 24kHz if needed
         let samples = if self.sample_rate == TARGET_SAMPLE_RATE {
             raw_samples
         } else {
@@ -117,6 +124,21 @@ impl VoiceCapture {
         let buf = self.samples.lock().unwrap();
         let recent = if buf.len() > 1024 { &buf[buf.len() - 1024..] } else { &buf };
         recent.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
+    }
+
+    /// Number of samples captured so far (at native sample rate).
+    pub fn duration_samples(&self) -> usize {
+        self.samples.lock().unwrap().len()
+    }
+
+    /// Get a snapshot of all samples captured so far (resampled to 24kHz).
+    pub fn samples_snapshot(&self) -> Vec<f32> {
+        let raw = self.samples.lock().unwrap().clone();
+        if self.sample_rate == TARGET_SAMPLE_RATE {
+            raw
+        } else {
+            resample(&raw, self.sample_rate, TARGET_SAMPLE_RATE)
+        }
     }
 }
 
@@ -164,75 +186,241 @@ pub fn encode_wav(samples: &[f32]) -> Result<Vec<u8>, String> {
     Ok(cursor.into_inner())
 }
 
-/// Find silence-delimited chunks in audio for real-time transcription.
-/// Returns byte offsets where safe chunk boundaries are.
-pub fn find_chunk_boundaries(samples: &[f32]) -> Vec<usize> {
-    let window_size = TARGET_SAMPLE_RATE as usize / 10; // 100ms windows
-    let min_silence_windows = 3; // 300ms of silence = chunk boundary
+// ── Local Parakeet transcription ──
 
-    let mut boundaries = Vec::new();
-    let mut silence_count = 0;
+/// Global transcriber instance — model stays loaded across calls.
+static TRANSCRIBER: LazyLock<Mutex<LocalTranscriber>> =
+    LazyLock::new(|| Mutex::new(LocalTranscriber::default()));
 
-    for (i, window) in samples.chunks(window_size).enumerate() {
-        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+#[derive(Default)]
+struct LocalTranscriber {
+    loaded_model_dir: Option<PathBuf>,
+    engine: Option<ParakeetEngine>,
+}
 
-        if rms < SILENCE_THRESHOLD {
-            silence_count += 1;
-            if silence_count == min_silence_windows {
-                let boundary = (i - min_silence_windows + 1) * window_size;
-                if boundary > MIN_CHUNK_SAMPLES {
-                    boundaries.push(boundary);
-                }
-            }
-        } else {
-            silence_count = 0;
+impl LocalTranscriber {
+    fn transcribe(&mut self, samples: Vec<f32>, model_dir: &Path) -> Result<String, String> {
+        if samples.is_empty() {
+            return Ok(String::new());
         }
+
+        self.ensure_model_loaded(model_dir)?;
+
+        let result = match self.engine.as_mut() {
+            Some(engine) => {
+                let params = ParakeetInferenceParams {
+                    timestamp_granularity: TimestampGranularity::Segment,
+                    ..Default::default()
+                };
+                engine
+                    .transcribe_samples(samples, Some(params))
+                    .map_err(|err| format!("Parakeet transcription failed: {err}"))?
+                    .text
+            }
+            None => return Err("no local voice engine loaded".to_string()),
+        };
+
+        Ok(result.trim().to_string())
     }
 
-    boundaries
+    fn ensure_model_loaded(&mut self, model_dir: &Path) -> Result<(), String> {
+        if self.loaded_model_dir.as_deref() == Some(model_dir) && self.engine.is_some() {
+            return Ok(());
+        }
+
+        let mut engine = ParakeetEngine::new();
+        engine
+            .load_model_with_params(model_dir, ParakeetModelParams::int8())
+            .map_err(|err| format!("failed to load Parakeet model: {err}"))?;
+        self.engine = Some(engine);
+        self.loaded_model_dir = Some(model_dir.to_path_buf());
+        Ok(())
+    }
 }
 
-/// Transcribe audio using whatever backend is available.
-/// Tries Parakeet locally first, falls back to whisper CLI.
-pub async fn transcribe(samples: &[f32]) -> Result<String, String> {
-    // Try local Parakeet model first
-    let parakeet_path = dirs::data_local_dir()
-        .unwrap_or_default()
-        .join("com.openai.codex/voice/models/parakeet-tdt-0.6b-v3-int8");
+/// Progress callback for model download.
+pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
-    if parakeet_path.exists() {
-        return transcribe_parakeet(samples, &parakeet_path).await;
-    }
+/// Transcribe audio using the local Parakeet V3 model.
+/// Downloads the model on first use (~200MB from blob.handy.computer).
+/// If `on_progress` is provided, it's called with status messages during download.
+pub async fn transcribe(
+    samples: &[f32],
+    on_progress: Option<ProgressCallback>,
+) -> Result<String, String> {
+    // Ensure model is downloaded (async-safe) before entering blocking thread
+    let model_dir = ensure_model_assets_async(on_progress).await?;
+    let samples = samples.to_vec();
 
-    // Fall back to whisper CLI
-    let wav_bytes = encode_wav(samples)?;
-    let tmp = std::env::temp_dir().join("replay_voice.wav");
-    std::fs::write(&tmp, &wav_bytes).map_err(|e| format!("Write tmp: {e}"))?;
-
-    let output = tokio::process::Command::new("whisper")
-        .args(["--model", "base", "--output_format", "txt", "--output_dir", "/tmp"])
-        .arg(&tmp)
-        .output()
-        .await
-        .map_err(|e| format!("whisper not found: {e}"))?;
-
-    if !output.status.success() {
-        return Err("Whisper transcription failed".to_string());
-    }
-
-    let txt_path = std::env::temp_dir().join("replay_voice.txt");
-    std::fs::read_to_string(&txt_path)
-        .map_err(|e| format!("Read transcription: {e}"))
-        .map(|s| s.trim().to_string())
+    // Run transcription on a blocking thread (model inference is CPU-bound)
+    tokio::task::spawn_blocking(move || {
+        let mut transcriber = TRANSCRIBER
+            .lock()
+            .map_err(|_| "transcriber mutex poisoned".to_string())?;
+        transcriber.transcribe(samples, &model_dir)
+    })
+    .await
+    .map_err(|e| format!("transcription task failed: {e}"))?
 }
 
-/// Transcribe using local Parakeet model.
-async fn transcribe_parakeet(samples: &[f32], _model_path: &std::path::Path) -> Result<String, String> {
-    // TODO: integrate transcribe-rs directly when we add it as a dep
-    // For now, use the Codex parakeet binary if available
-    let wav_bytes = encode_wav(samples)?;
-    let tmp = std::env::temp_dir().join("replay_voice_parakeet.wav");
-    std::fs::write(&tmp, &wav_bytes).map_err(|e| format!("Write tmp: {e}"))?;
+// ── Model asset management ──
 
-    Err("Parakeet model found but native integration not yet available. Install whisper CLI as fallback.".to_string())
+async fn ensure_model_assets_async(on_progress: Option<ProgressCallback>) -> Result<PathBuf, String> {
+    let voice_root = voice_root()?;
+    let model_dir = voice_root.join("models").join(LOCAL_VOICE_MODEL_DIRNAME);
+    let ready_marker = model_dir.join("encoder-model.int8.onnx");
+
+    if ready_marker.is_file() {
+        return Ok(model_dir);
+    }
+
+    std::fs::create_dir_all(voice_root.join("models"))
+        .map_err(|e| format!("failed to create voice model directory: {e}"))?;
+
+    download_and_extract_model_async(&model_dir, &ready_marker, on_progress).await?;
+
+    if !ready_marker.is_file() {
+        return Err("model installed but encoder file is missing".to_string());
+    }
+
+    Ok(model_dir)
+}
+
+async fn download_and_extract_model_async(
+    model_dir: &Path,
+    ready_marker: &Path,
+    on_progress: Option<ProgressCallback>,
+) -> Result<(), String> {
+    let report = |msg: &str| {
+        if let Some(cb) = &on_progress {
+            cb(msg);
+        }
+    };
+
+    let cache_dir = voice_cache_dir()?;
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("failed to create voice cache directory: {e}"))?;
+    let archive_path = cache_dir.join(format!("{LOCAL_VOICE_MODEL_DIRNAME}.tar.gz"));
+
+    // Download if not cached
+    if !archive_path.is_file() {
+        report("Downloading Parakeet V3 model...");
+        let response = reqwest::get(LOCAL_VOICE_MODEL_URL)
+            .await
+            .map_err(|e| format!("failed to download voice model: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("download failed: HTTP {}", response.status()));
+        }
+        let total_size = response.content_length().unwrap_or(0);
+        let mut downloaded: u64 = 0;
+        let mut bytes_buf = Vec::with_capacity(total_size as usize);
+
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("download error: {e}"))?;
+            downloaded += chunk.len() as u64;
+            bytes_buf.extend_from_slice(&chunk);
+            if total_size > 0 {
+                let pct = (downloaded * 100 / total_size).min(100);
+                report(&format!("Downloading Parakeet V3... {pct}%"));
+            }
+        }
+        report("Download complete, extracting...");
+        std::fs::write(&archive_path, &bytes_buf)
+            .map_err(|e| format!("failed to write voice archive: {e}"))?;
+    }
+
+    // Extract to temp dir, then move into place (CPU-bound, run on blocking thread)
+    let archive_path_clone = archive_path.clone();
+    let model_dir = model_dir.to_path_buf();
+    let ready_marker = ready_marker.to_path_buf();
+    let cache_dir_clone = cache_dir.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let tmp_dir = cache_dir_clone.join(format!("extract-{}", std::process::id()));
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir).ok();
+        }
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| format!("failed to create temp dir: {e}"))?;
+
+        let extract_result = (|| -> Result<(), String> {
+            let file = std::fs::File::open(&archive_path_clone)
+                .map_err(|e| format!("failed to open archive: {e}"))?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = Archive::new(decoder);
+            archive.unpack(&tmp_dir)
+                .map_err(|e| format!("failed to unpack archive: {e}"))?;
+            Ok(())
+        })();
+
+        if extract_result.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return extract_result;
+        }
+
+        let extracted = tmp_dir.join(LOCAL_VOICE_MODEL_DIRNAME);
+        if !extracted.is_dir() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(format!("archive missing expected directory {LOCAL_VOICE_MODEL_DIRNAME}"));
+        }
+
+        if model_dir.exists() {
+            std::fs::remove_dir_all(&model_dir)
+                .map_err(|e| format!("failed to replace model directory: {e}"))?;
+        }
+        std::fs::rename(&extracted, &model_dir)
+            .map_err(|e| format!("failed to install model: {e}"))?;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        if !ready_marker.is_file() {
+            return Err("model installed but encoder file is missing".to_string());
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("extraction task failed: {e}"))?
+}
+
+/// Resolve voice data root directory.
+/// Checks: REPLAY_VOICE_ROOT env > codex legacy path > replay default.
+fn voice_root() -> Result<PathBuf, String> {
+    if let Ok(root) = std::env::var("REPLAY_VOICE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+
+    let data_dir = dirs::data_local_dir()
+        .ok_or("failed to resolve local data directory")?;
+
+    // Reuse codex's model if already downloaded
+    let codex_root = data_dir.join("com.openai.codex").join("voice");
+    let codex_marker = codex_root.join("models")
+        .join(LOCAL_VOICE_MODEL_DIRNAME)
+        .join("encoder-model.int8.onnx");
+    if codex_marker.is_file() {
+        return Ok(codex_root);
+    }
+
+    // Check legacy Handy path
+    let handy_root = data_dir.join("com.pais.handy");
+    let handy_marker = handy_root.join("models")
+        .join(LOCAL_VOICE_MODEL_DIRNAME)
+        .join("encoder-model.int8.onnx");
+    if handy_marker.is_file() {
+        return Ok(handy_root);
+    }
+
+    // Default to replay's own path
+    Ok(data_dir.join("cc.riff.replay").join("voice"))
+}
+
+fn voice_cache_dir() -> Result<PathBuf, String> {
+    if let Ok(root) = std::env::var("REPLAY_VOICE_CACHE_DIR") {
+        return Ok(PathBuf::from(root));
+    }
+    let cache_dir = dirs::cache_dir()
+        .ok_or("failed to resolve cache directory")?;
+    Ok(cache_dir.join("replay"))
 }
