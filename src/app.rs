@@ -989,11 +989,18 @@ impl App {
                                     drop(state);
                                     if !self.input_buffer.is_empty() {
                                         let line = self.input_buffer.clone();
-                                        self.history.push(line.clone());
-                                        self.history_index = None;
-                                        self.input_buffer.clear();
-                                        self.input_cursor = 0;
-                                        let _ = self.event_tx.send(AppEvent::Submit(line));
+
+                                        // Handle TUI-local slash commands that work even during agent execution
+                                        if self.handle_local_slash(&line) {
+                                            self.input_buffer.clear();
+                                            self.input_cursor = 0;
+                                        } else {
+                                            self.history.push(line.clone());
+                                            self.history_index = None;
+                                            self.input_buffer.clear();
+                                            self.input_cursor = 0;
+                                            let _ = self.event_tx.send(AppEvent::Submit(line));
+                                        }
                                     }
                                 }
                             }
@@ -1856,6 +1863,67 @@ impl App {
     }
 
     /// Handle a key for the job browser. Returns true if consumed.
+    /// Handle slash commands that work in the TUI thread without the async loop.
+    /// Returns true if handled locally (don't send to main loop).
+    fn handle_local_slash(&mut self, line: &str) -> bool {
+        match line.trim() {
+            "/model" => {
+                let mut s = self.state.lock().unwrap();
+                let current_name = s.model_name.clone();
+                let options: Vec<MenuOption> = crate::models::MODELS.iter().map(|m| {
+                    MenuOption {
+                        label: m.name.to_string(),
+                        description: Some(m.provider.to_string()),
+                        enabled: crate::models::is_available(m),
+                    }
+                }).collect();
+                let picker_state = Arc::clone(&self.state);
+                s.show_menu(
+                    format!("Select model (currently: {current_name})"),
+                    options,
+                    move |selected| {
+                        if let Some(idx) = selected {
+                            if let Some(m) = crate::models::MODELS.get(idx) {
+                                let mut s = picker_state.lock().unwrap();
+                                s.selected_model_id = m.model_id.to_string();
+                                s.model_name = m.name.to_string();
+                                s.context_window = m.context_window;
+                                s.show_model = true;
+                                drop(s);
+                                crate::config::save_model(m.model_id);
+                            }
+                        }
+                    },
+                );
+                true
+            }
+            "/usage" => {
+                let mut s = self.state.lock().unwrap();
+                s.show_usage = !s.show_usage;
+                true
+            }
+            "/context" => {
+                let mut s = self.state.lock().unwrap();
+                s.show_context = !s.show_context;
+                true
+            }
+            "/project" => {
+                let mut s = self.state.lock().unwrap();
+                s.show_project = !s.show_project;
+                true
+            }
+            "/couch" => {
+                let mut s = self.state.lock().unwrap();
+                s.couch_mode = !s.couch_mode;
+                s.couch_mode_notify = 30;
+                let mode = if s.couch_mode { "on" } else { "off" };
+                s.push_output(format!("\u{1F3AE} Couch mode {mode}"));
+                true
+            }
+            _ => false, // Not a local command — send to main loop
+        }
+    }
+
     fn handle_job_browser_key(&mut self, code: KeyCode) -> bool {
         let mut state = self.state.lock().unwrap();
 
