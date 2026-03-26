@@ -533,12 +533,11 @@ async fn main() -> Result<()> {
                 );
 
                 // Race agent against interrupt events.
-                // The cancel flag is also checked inside the ToolRunner between
-                // iterations and tool calls, so even in-flight work stops promptly.
+                // Queue any Submit events that arrive while agent is running.
+                let mut queued_submits: Vec<String> = Vec::new();
                 let result = tokio::select! {
                     result = agent_future => result,
                     _ = async {
-                        // Wait for interrupt events while agent runs
                         loop {
                             match event_rx.recv().await {
                                 Some(AppEvent::Interrupt) => {
@@ -549,8 +548,14 @@ async fn main() -> Result<()> {
                                     cancelled.store(true, Ordering::SeqCst);
                                     break;
                                 }
+                                Some(AppEvent::Submit(msg)) => {
+                                    let mut s = agent_state.lock().unwrap();
+                                    s.push_output(format!("  \x1b[2m(queued: {msg})\x1b[0m"));
+                                    drop(s);
+                                    queued_submits.push(msg);
+                                }
                                 None => break,
-                                _ => {} // ignore other events while agent runs
+                                _ => {}
                             }
                         }
                     } => Err(anyhow::anyhow!("interrupted")),
@@ -583,6 +588,11 @@ async fn main() -> Result<()> {
                         let mut s = state.lock().unwrap();
                         s.push_output(format!("warning: failed to save session: {e:#}"));
                     }
+                }
+
+                // Replay queued messages that arrived while agent was running
+                for queued in queued_submits {
+                    let _ = event_tx.send(AppEvent::Submit(queued));
                 }
             }
             AppEvent::Interrupt => {
