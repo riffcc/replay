@@ -534,7 +534,6 @@ async fn main() -> Result<()> {
 
                 // Race agent against interrupt events.
                 // Queue any Submit events that arrive while agent is running.
-                let mut queued_submits: Vec<String> = Vec::new();
                 let result = tokio::select! {
                     result = agent_future => result,
                     _ = async {
@@ -551,8 +550,7 @@ async fn main() -> Result<()> {
                                 Some(AppEvent::Submit(msg)) => {
                                     let mut s = agent_state.lock().unwrap();
                                     s.push_output(format!("  \x1b[2m(queued: {msg})\x1b[0m"));
-                                    drop(s);
-                                    queued_submits.push(msg);
+                                    s.queued_messages.push(msg);
                                 }
                                 None => break,
                                 _ => {}
@@ -591,8 +589,12 @@ async fn main() -> Result<()> {
                 }
 
                 // Replay queued messages that arrived while agent was running
-                for queued in queued_submits {
-                    let _ = event_tx.send(AppEvent::Submit(queued));
+                let queued = {
+                    let mut s = state.lock().unwrap();
+                    std::mem::take(&mut s.queued_messages)
+                };
+                for msg in queued {
+                    let _ = event_tx.send(AppEvent::Submit(msg));
                 }
             }
             AppEvent::Interrupt => {

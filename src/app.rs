@@ -341,6 +341,8 @@ pub struct AppState {
     pub scroll_offset: usize,
     /// Whether the agent is currently working.
     pub agent_active: bool,
+    /// Messages queued while agent is running.
+    pub queued_messages: Vec<String>,
     /// Transient status message shown in the input border.
     pub status_message: Option<String>,
     /// Throbber frame for animation.
@@ -412,6 +414,7 @@ impl AppState {
             term_width: w as usize,
             scroll_offset: 0,
             agent_active: false,
+            queued_messages: Vec::new(),
             status_message: None,
             throbber_frame: 0,
             throbber_state: 0,
@@ -1054,6 +1057,17 @@ impl App {
                             self.input_cursor = self.input_buffer.len();
                         }
                         KeyCode::Up => {
+                            // If agent is active and there are queued messages, pop last one for editing
+                            {
+                                let mut s = self.state.lock().unwrap();
+                                if s.agent_active && !s.queued_messages.is_empty() {
+                                    let msg = s.queued_messages.pop().unwrap();
+                                    drop(s);
+                                    self.input_buffer = msg;
+                                    self.input_cursor = self.input_buffer.len();
+                                    continue;
+                                }
+                            }
                             if self.history.is_empty() {
                                 continue;
                             }
