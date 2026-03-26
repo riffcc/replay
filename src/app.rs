@@ -860,7 +860,18 @@ impl App {
                 }
 
                 let key = match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => key,
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Debug: log all key events to file
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/replay_keylog.txt")
+                        {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{:?} code={:?} mods={:?}",
+                                std::time::SystemTime::now(), key.code, key.modifiers);
+                        }
+                        key
+                    }
                     _ => continue,
                 };
 
