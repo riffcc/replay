@@ -1003,7 +1003,7 @@ impl AppState {
             let layer = record.metadata.as_ref()
                 .and_then(|m| m.get("layer")).and_then(|v| v.as_str())
                 .unwrap_or("raw");
-            let code_style = Style::default().fg(Color::Green);
+            let code_style = Style::default();
 
             // Extract just the code content (skip headers/separators)
             let lines: Vec<&str> = output.lines().collect();
