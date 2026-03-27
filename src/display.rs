@@ -19,11 +19,23 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 
+fn format_diffstat(added_lines: usize, removed_lines: usize) -> String {
+    if added_lines == 0 && removed_lines == 0 {
+        String::new()
+    } else {
+        format!(" {GREEN}+{added_lines}{RESET} {RED}-{removed_lines}{RESET}")
+    }
+}
+
 /// Current display state for progressive output.
 #[derive(Debug)]
 enum ActiveGroup {
     Reads { files: Vec<String> },
-    Writes { files: Vec<String> },
+    Writes {
+        files: Vec<String>,
+        added_lines: usize,
+        removed_lines: usize,
+    },
 }
 
 /// Display state shared across tool events.
@@ -51,8 +63,13 @@ impl DisplayState {
             ToolEvent::ToolCall { name, input } => {
                 self.handle_call(name, input);
             }
-            ToolEvent::ToolResult { name, success, output } => {
-                self.handle_result(name, *success, output);
+            ToolEvent::ToolResult {
+                name,
+                success,
+                output,
+                metadata,
+            } => {
+                self.handle_result(name, *success, output, metadata.as_ref());
             }
             ToolEvent::Usage { .. } => {
                 // Handled by app state, not display
@@ -77,12 +94,16 @@ impl DisplayState {
             }
             "write" => {
                 let file = s("path");
-                if let Some(ActiveGroup::Writes { files }) = &mut self.active {
+                if let Some(ActiveGroup::Writes { files, .. }) = &mut self.active {
                     files.push(file);
                     self.redraw_group();
                 } else {
                     self.flush();
-                    self.active = Some(ActiveGroup::Writes { files: vec![file] });
+                    self.active = Some(ActiveGroup::Writes {
+                        files: vec![file],
+                        added_lines: 0,
+                        removed_lines: 0,
+                    });
                     self.redraw_group();
                 }
             }
@@ -151,7 +172,8 @@ impl DisplayState {
                 let repo = s("repoName");
                 let question = s("question");
                 let preview = truncate(&question, 80);
-                let line = format!("\u{1F4DA} DeepWiki \u{2014} Ask({DIM}{repo}: {preview}{RESET})");
+                let line =
+                    format!("\u{1F4DA} DeepWiki \u{2014} Ask({DIM}{repo}: {preview}{RESET})");
                 self.print_pending(&line);
             }
             "read_wiki_contents" => {
@@ -163,7 +185,8 @@ impl DisplayState {
             "read_wiki_structure" => {
                 self.flush();
                 let repo = s("repoName");
-                let line = format!("\u{1F4DA} DeepWiki \u{2014} Structure({DIM}{repo}{RESET})");
+                let line =
+                    format!("\u{1F4DA} DeepWiki \u{2014} Structure({DIM}{repo}{RESET})");
                 self.print_pending(&line);
             }
             _ => {
@@ -181,9 +204,37 @@ impl DisplayState {
         }
     }
 
-    fn handle_result(&mut self, name: &str, success: bool, output: &str) {
+    fn handle_result(
+        &mut self,
+        name: &str,
+        success: bool,
+        output: &str,
+        metadata: Option<&serde_json::Value>,
+    ) {
         match name {
-            "read" | "write" => {
+            "read" => {
+                self.update_group_status(success);
+                if self.verbose {
+                    println!();
+                    println!("  output: {output}");
+                }
+            }
+            "write" => {
+                if let Some(ActiveGroup::Writes {
+                    added_lines,
+                    removed_lines,
+                    ..
+                }) = &mut self.active
+                {
+                    if let Some(meta) = metadata {
+                        *added_lines +=
+                            meta.get("added_lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        *removed_lines += meta
+                            .get("removed_lines")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                    }
+                }
                 self.update_group_status(success);
                 if self.verbose {
                     println!();
@@ -263,9 +314,15 @@ impl DisplayState {
                 let file_list = files.join(", ");
                 write!(out, "{YELLOW}●{RESET} \u{1F4DA} Read({DIM}{file_list}{RESET})").ok();
             }
-            Some(ActiveGroup::Writes { files }) => {
+            Some(ActiveGroup::Writes {
+                files,
+                added_lines,
+                removed_lines,
+            }) => {
                 let file_list = files.join(", ");
-                write!(out, "{YELLOW}●{RESET} \u{1F4DD} Write({DIM}{file_list}{RESET})").ok();
+                let diffstat = format_diffstat(*added_lines, *removed_lines);
+                write!(out, "{YELLOW}●{RESET} \u{1F4DD} Write({DIM}{file_list}{RESET}){diffstat}")
+                    .ok();
             }
             None => {}
         }
@@ -273,7 +330,11 @@ impl DisplayState {
     }
 
     fn update_group_status(&self, success: bool) {
-        let bullet = if success { format!("{GREEN}●{RESET}") } else { format!("{RED}●{RESET}") };
+        let bullet = if success {
+            format!("{GREEN}●{RESET}")
+        } else {
+            format!("{RED}●{RESET}")
+        };
         let mut out = io::stdout();
         write!(out, "\r\x1b[2K").ok();
         match &self.active {
@@ -281,9 +342,14 @@ impl DisplayState {
                 let file_list = files.join(", ");
                 write!(out, "{bullet} \u{1F4DA} Read({DIM}{file_list}{RESET})").ok();
             }
-            Some(ActiveGroup::Writes { files }) => {
+            Some(ActiveGroup::Writes {
+                files,
+                added_lines,
+                removed_lines,
+            }) => {
                 let file_list = files.join(", ");
-                write!(out, "{bullet} \u{1F4DD} Write({DIM}{file_list}{RESET})").ok();
+                let diffstat = format_diffstat(*added_lines, *removed_lines);
+                write!(out, "{bullet} \u{1F4DD} Write({DIM}{file_list}{RESET}){diffstat}").ok();
             }
             None => {}
         }
@@ -312,7 +378,12 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Create a thread-safe display callback for the agent.
-pub fn create_callback(verbose: bool) -> (llm_code_sdk::tools::ToolEventCallback, std::sync::Arc<Mutex<DisplayState>>) {
+pub fn create_callback(
+    verbose: bool,
+) -> (
+    llm_code_sdk::tools::ToolEventCallback,
+    std::sync::Arc<Mutex<DisplayState>>,
+) {
     let state = std::sync::Arc::new(Mutex::new(DisplayState::new(verbose)));
     let state_clone = std::sync::Arc::clone(&state);
 

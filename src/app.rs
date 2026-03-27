@@ -23,6 +23,23 @@ pub struct OutputLine {
     pub styled: Option<Vec<Span<'static>>>,
 }
 
+/// Stored metadata for a tool call, used for expanded view.
+#[derive(Clone, Debug)]
+pub struct ToolCallRecord {
+    /// Tool name (e.g. "write", "bash", "read").
+    pub name: String,
+    /// Summary text shown in collapsed view (e.g. "src/agent.rs").
+    pub detail: String,
+    /// Index into raw_output where the collapsed line lives.
+    pub raw_index: usize,
+    /// Tool result output text (captured on ToolResult).
+    pub output: Option<String>,
+    /// Diffstat: (added, removed) — only for write tools.
+    pub diffstat: Option<(usize, usize)>,
+    /// Diff lines from metadata (unified-style: +added, -removed, context).
+    pub diff: Option<Vec<String>>,
+}
+
 /// Wrap a string to a given width with word-boundary reflow.
 /// Words that don't fit on the current line move to the next line.
 /// Words longer than `width` are force-broken by character.
@@ -398,6 +415,10 @@ pub struct AppState {
     pub active_menu: Option<Menu>,
     /// Text to insert into the input buffer (set by main loop, consumed by TUI thread).
     pub pending_insert: Option<String>,
+    /// Tool call records for expanded view (indexed by sequential call order).
+    pub tool_calls: Vec<ToolCallRecord>,
+    /// Expanded output view (Ctrl+O toggle).
+    pub expanded_view: bool,
     /// Token rate tracking for animation.
     pub last_token_update: std::time::Instant,
     pub token_rate: f64,        // tokens per second (smoothed)
@@ -441,6 +462,8 @@ impl AppState {
             bash_process_registry: None,
             active_menu: None,
             pending_insert: None,
+            tool_calls: Vec::new(),
+            expanded_view: false,
             model_name: String::new(),
             selected_model_id: String::new(),
             reasoning_effort: None,
@@ -552,6 +575,82 @@ impl AppState {
         self.scroll_offset = 0;
     }
 
+    /// Push a tool call line and record it for later update / expanded view.
+    pub fn push_tool_call(&mut self, name: &str, detail: &str, emoji: &str) {
+        let line = if detail.is_empty() {
+            format!("{emoji} {name}")
+        } else {
+            format!("{emoji} {name}({detail})")
+        };
+        let raw_index = self.raw_output.len();
+        self.raw_output.push(RawEntry::Plain(line.clone()));
+        for wrapped in wrap_text(&line, self.term_width) {
+            self.output.push(OutputLine { content: wrapped, styled: None });
+        }
+        self.tool_calls.push(ToolCallRecord {
+            name: name.to_string(),
+            detail: detail.to_string(),
+            raw_index,
+            output: None,
+            diffstat: None,
+            diff: None,
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Update the most recent matching tool call with result metadata.
+    /// Rewrites the collapsed line to include diffstat if available.
+    pub fn update_tool_result(&mut self, name: &str, output: String, metadata: Option<&serde_json::Value>) {
+        // Find the last tool call record with this name
+        let record = self.tool_calls.iter_mut().rev().find(|r| r.name == name);
+        let record = match record {
+            Some(r) => r,
+            None => return,
+        };
+
+        record.output = Some(output);
+
+        // Extract diffstat and diff hunks from metadata
+        if let Some(meta) = metadata {
+            let added = meta.get("added_lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let removed = meta.get("removed_lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if added > 0 || removed > 0 {
+                record.diffstat = Some((added, removed));
+            }
+            if let Some(hunks) = meta.get("hunks").and_then(|v| v.as_array()) {
+                let mut diff = Vec::new();
+                for entry in hunks {
+                    let op = entry.get("op").and_then(|v| v.as_str()).unwrap_or(" ");
+                    let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let text = entry.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    diff.push(format!("{op}\t{line}\t{text}"));
+                }
+                if !diff.is_empty() {
+                    record.diff = Some(diff);
+                }
+            }
+        }
+
+        // Rewrite the raw entry with diffstat appended
+        if let Some((added, removed)) = record.diffstat {
+            let emoji = match record.name.as_str() {
+                "write" => "\u{1F4DD}",
+                _ => return,
+            };
+            let detail = record.detail.clone();
+            let new_line = if detail.is_empty() {
+                format!("{emoji} {name} \x1b[32m+{added}\x1b[0m \x1b[31m-{removed}\x1b[0m")
+            } else {
+                format!("{emoji} {name}({detail}) \x1b[32m+{added}\x1b[0m \x1b[31m-{removed}\x1b[0m")
+            };
+
+            let raw_idx = record.raw_index;
+            self.raw_output[raw_idx] = RawEntry::Ansi(new_line);
+            // Full rewrap to update display
+            self.rewrap(self.term_width);
+        }
+    }
+
     /// Push ANSI-colored content — parses escape codes into styled spans.
     pub fn push_ansi(&mut self, content: String) {
         self.raw_output.push(RawEntry::Ansi(content.clone()));
@@ -651,6 +750,273 @@ impl AppState {
             }
         }
         self.scroll_offset = 0;
+    }
+
+    /// Rebuild output from raw entries, inserting expanded tool details when expanded_view is on.
+    pub fn rebuild_output(&mut self) {
+        self.output.clear();
+        let width = self.term_width;
+
+        // Collect expanded tool details (cloned to avoid borrow conflict)
+        let tool_details: std::collections::HashMap<usize, ToolCallRecord> = if self.expanded_view {
+            self.tool_calls.iter().filter(|r| r.output.is_some()).map(|r| (r.raw_index, r.clone())).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let raw_entries: Vec<RawEntry> = self.raw_output.iter().cloned().collect();
+        for (i, raw) in raw_entries.iter().enumerate() {
+            // Render the raw entry normally
+            match raw {
+                RawEntry::Plain(text) => {
+                    for line in wrap_text(text, width) {
+                        self.output.push(OutputLine { content: line, styled: None });
+                    }
+                }
+                RawEntry::Markdown(text) => {
+                    let styled_lines = crate::markdown::render(text);
+                    for line in styled_lines {
+                        for wrapped in wrap_styled_line(&line, width) {
+                            let plain: String = wrapped.spans.iter().map(|s| s.content.as_ref()).collect();
+                            self.output.push(OutputLine {
+                                content: plain,
+                                styled: Some(wrapped.spans),
+                            });
+                        }
+                    }
+                }
+                RawEntry::Ansi(text) => {
+                    let styled_lines = crate::ansi::parse_to_lines(text);
+                    for line in styled_lines {
+                        for wrapped in wrap_styled_line(&line, width) {
+                            let plain: String = wrapped.spans.iter().map(|s| s.content.as_ref()).collect();
+                            self.output.push(OutputLine {
+                                content: plain,
+                                styled: Some(wrapped.spans),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // If expanded view is on and this raw index has a tool record, render details
+            if let Some(record) = tool_details.get(&i) {
+                self.render_expanded_tool(record, width);
+            }
+        }
+        self.scroll_offset = 0;
+    }
+
+    /// Build styled spans for a diff line with inline character-level highlighting.
+    /// `text` is this line's content, `other` is the paired line to diff against.
+    /// Only the characters that differ get the highlighted background; the rest
+    /// are shown in the base color.
+    fn inline_diff_spans(
+        text: &str,
+        line_no: usize,
+        op: &str,
+        base_style: Style,
+        highlight_style: Style,
+        dim: Style,
+        bar: &str,
+        num_width: usize,
+        other: &str,
+    ) -> Vec<Span<'static>> {
+        // Find common prefix length (in chars)
+        let text_chars: Vec<char> = text.chars().collect();
+        let other_chars: Vec<char> = other.chars().collect();
+
+        let mut prefix_len = 0;
+        while prefix_len < text_chars.len()
+            && prefix_len < other_chars.len()
+            && text_chars[prefix_len] == other_chars[prefix_len]
+        {
+            prefix_len += 1;
+        }
+
+        // Find common suffix length (in chars), not overlapping with prefix
+        let mut suffix_len = 0;
+        while suffix_len < text_chars.len().saturating_sub(prefix_len)
+            && suffix_len < other_chars.len().saturating_sub(prefix_len)
+            && text_chars[text_chars.len() - 1 - suffix_len] == other_chars[other_chars.len() - 1 - suffix_len]
+        {
+            suffix_len += 1;
+        }
+
+        let prefix: String = text_chars[..prefix_len].iter().collect();
+        let middle_end = text_chars.len().saturating_sub(suffix_len);
+        let changed: String = text_chars[prefix_len..middle_end].iter().collect();
+        let suffix: String = text_chars[middle_end..].iter().collect();
+
+        let mut spans = vec![
+            Span::styled(format!("  {bar} "), dim),
+            Span::styled(format!("{:>w$}", line_no, w = num_width), base_style),
+            Span::styled(format!(" {op} "), base_style),
+        ];
+
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, base_style));
+        }
+        if !changed.is_empty() {
+            spans.push(Span::styled(changed, highlight_style));
+        }
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix, base_style));
+        }
+
+        // Edge case: if text is empty, show nothing after the gutter
+        if text_chars.is_empty() {
+            // spans already have gutter, that's fine
+        }
+
+        spans
+    }
+
+    /// Render expanded tool details below the tool call line.
+    fn render_expanded_tool(&mut self, record: &ToolCallRecord, _width: usize) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let green = Style::default().fg(Color::Green);
+        let green_bg = Style::default().fg(Color::Green).bg(Color::Rgb(0, 40, 0));
+        let red = Style::default().fg(Color::Red);
+        let red_bg = Style::default().fg(Color::Red).bg(Color::Rgb(40, 0, 0));
+        let bar = "\u{2502}"; // │
+
+        // Write tools: show colored diff with line numbers and inline highlighting
+        if record.name == "write" {
+            if let Some(diff) = &record.diff {
+                // Parse entries
+                struct DiffEntry { op: String, line_no: usize, text: String }
+                let entries: Vec<DiffEntry> = diff.iter().filter_map(|e| {
+                    let parts: Vec<&str> = e.splitn(3, '\t').collect();
+                    if parts.len() < 3 { return None; }
+                    Some(DiffEntry {
+                        op: parts[0].to_string(),
+                        line_no: parts[1].parse().unwrap_or(0),
+                        text: parts[2].to_string(),
+                    })
+                }).collect();
+
+                let max_line = entries.iter().map(|e| e.line_no).max().unwrap_or(1);
+                let num_width = format!("{max_line}").len();
+
+                // Group consecutive -/+ blocks for inline diffing
+                let mut i = 0;
+                while i < entries.len() {
+                    let e = &entries[i];
+
+                    if e.op == " " {
+                        // Context line
+                        let styled_line = Line::from(vec![
+                            Span::styled(format!("  {bar} "), dim),
+                            Span::styled(format!("{:>w$}", e.line_no, w = num_width), dim),
+                            Span::styled("   ", dim),
+                            Span::styled(e.text.clone(), dim),
+                        ]);
+                        let plain = format!("  {bar} {:>w$}   {}", e.line_no, e.text, w = num_width);
+                        self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                        i += 1;
+                        continue;
+                    }
+
+                    // Collect consecutive removed lines
+                    let mut removed: Vec<&DiffEntry> = Vec::new();
+                    while i < entries.len() && entries[i].op == "-" {
+                        removed.push(&entries[i]);
+                        i += 1;
+                    }
+                    // Collect consecutive added lines
+                    let mut added: Vec<&DiffEntry> = Vec::new();
+                    while i < entries.len() && entries[i].op == "+" {
+                        added.push(&entries[i]);
+                        i += 1;
+                    }
+
+                    // Pair up removed/added for inline diff, render unpaired lines whole
+                    let pairs = removed.len().min(added.len());
+
+                    for j in 0..removed.len() {
+                        let r = removed[j];
+                        if j < pairs {
+                            // Paired: inline diff against added[j]
+                            let a = added[j];
+                            let spans = Self::inline_diff_spans(
+                                &r.text, r.line_no, "-", red, red_bg, dim, bar, num_width,
+                                &a.text,
+                            );
+                            let plain = format!("  {bar} {:>w$} - {}", r.line_no, r.text, w = num_width);
+                            self.output.push(OutputLine { content: plain, styled: Some(spans) });
+                        } else {
+                            // Unpaired removed: highlight whole line
+                            let styled_line = Line::from(vec![
+                                Span::styled(format!("  {bar} "), dim),
+                                Span::styled(format!("{:>w$}", r.line_no, w = num_width), red),
+                                Span::styled(" - ", red),
+                                Span::styled(r.text.clone(), red_bg),
+                            ]);
+                            let plain = format!("  {bar} {:>w$} - {}", r.line_no, r.text, w = num_width);
+                            self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                        }
+                    }
+
+                    for j in 0..added.len() {
+                        let a = added[j];
+                        if j < pairs {
+                            // Paired: inline diff against removed[j]
+                            let r = removed[j];
+                            let spans = Self::inline_diff_spans(
+                                &a.text, a.line_no, "+", green, green_bg, dim, bar, num_width,
+                                &r.text,
+                            );
+                            let plain = format!("  {bar} {:>w$} + {}", a.line_no, a.text, w = num_width);
+                            self.output.push(OutputLine { content: plain, styled: Some(spans) });
+                        } else {
+                            // Unpaired added: highlight whole line
+                            let styled_line = Line::from(vec![
+                                Span::styled(format!("  {bar} "), dim),
+                                Span::styled(format!("{:>w$}", a.line_no, w = num_width), green),
+                                Span::styled(" + ", green),
+                                Span::styled(a.text.clone(), green_bg),
+                            ]);
+                            let plain = format!("  {bar} {:>w$} + {}", a.line_no, a.text, w = num_width);
+                            self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        let output = match &record.output {
+            Some(o) if !o.is_empty() => o,
+            _ => return,
+        };
+
+        // Non-write tools: generic display
+        {
+            // Generic tool — just show output lines dimmed
+            for line in output.lines().take(20) {
+                let styled_line = Line::from(vec![
+                    Span::styled(format!("  {bar} "), dim),
+                    Span::styled(line.to_string(), dim),
+                ]);
+                self.output.push(OutputLine {
+                    content: format!("  {bar} {line}"),
+                    styled: Some(styled_line.spans),
+                });
+            }
+            let total_lines = output.lines().count();
+            if total_lines > 20 {
+                let remaining = total_lines - 20;
+                let truncated = Line::from(vec![
+                    Span::styled(format!("  {bar} "), dim),
+                    Span::styled(format!("... {remaining} more lines"), dim),
+                ]);
+                self.output.push(OutputLine {
+                    content: format!("  {bar} ... {remaining} more lines"),
+                    styled: Some(truncated.spans),
+                });
+            }
+        }
     }
 }
 
@@ -898,7 +1264,7 @@ impl App {
                 }
 
                 // Survey and menu input take priority
-                if self.handle_job_browser_key(key.code) || self.handle_survey_key(key.code) || self.handle_menu_key(key.code) {
+                if self.handle_job_browser_key(key.code) || self.handle_survey_key(key.code, key.modifiers) || self.handle_menu_key(key.code) {
                     continue;
                 }
 
@@ -949,6 +1315,14 @@ impl App {
                                 crate::clipboard::ClipboardContent::Empty => {}
                             }
                             self.voice_insert_start = None;
+                        }
+                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let mut s = self.state.lock().unwrap();
+                            s.expanded_view = !s.expanded_view;
+                            let label = if s.expanded_view { "expanded" } else { "compact" };
+                            s.status_message = Some(format!("Output view: {label}"));
+                            // Rebuild output from raw entries with new view mode
+                            s.rebuild_output();
                         }
                         KeyCode::Esc => {
                             let state = self.state.lock().unwrap();
@@ -1840,7 +2214,7 @@ impl App {
 
         // Process collected actions
         for code in actions {
-            if self.handle_job_browser_key(code) || self.handle_survey_key(code) || self.handle_menu_key(code) {
+            if self.handle_job_browser_key(code) || self.handle_survey_key(code, KeyModifiers::NONE) || self.handle_menu_key(code) {
                 continue;
             }
 
@@ -2047,7 +2421,7 @@ impl App {
     }
 
     /// Handle a key for the agent's survey. Returns true if consumed.
-    fn handle_survey_key(&mut self, code: KeyCode) -> bool {
+    fn handle_survey_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         let mut state = self.state.lock().unwrap();
         let survey = match &mut state.pending_survey {
             Some(s) => s,
@@ -2055,6 +2429,16 @@ impl App {
         };
 
         let option_count = survey.options.len();
+
+        // Ctrl+C cancels like Esc
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            let survey = state.pending_survey.take().unwrap();
+            state.push_output(format!("  {}", survey.prompt));
+            state.push_output("  (cancelled)".to_string());
+            state.push_output(String::new());
+            let _ = survey.response_tx.send(llm_code_sdk::tools::SurveyResponse { selected: vec![] });
+            return true;
+        }
 
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
