@@ -16,8 +16,8 @@ mod process_manager;
 mod spawn_tool;
 mod subagent;
 mod survey_ui;
+
 mod throbber;
-mod tui;
 mod voice;
 
 pub const VERSION: &str = "0.1.0";
@@ -25,7 +25,7 @@ pub const VERSION: &str = "0.1.0";
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
 
 use app::{App, AppEvent, AppState};
@@ -56,6 +56,12 @@ async fn main() -> Result<()> {
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
     let resume_latest = args.iter().any(|a| a == "-r");
     let list_all = args.iter().any(|a| a == "--all");
+    let sandbox_mode = args.iter().position(|a| a == "--sandbox").and_then(|pos| {
+        args.get(pos + 1).and_then(|v| agent::SandboxMode::parse(v))
+    }).unwrap_or(agent::SandboxMode::WorkspaceWrite);
+    if args.iter().any(|a| a == "--sandbox") && !args.iter().enumerate().any(|(i, a)| a == "--sandbox" && args.get(i + 1).and_then(|v| agent::SandboxMode::parse(v)).is_some()) {
+        return Err(anyhow!("invalid --sandbox value (expected read-only, workspace-write, or dangerous-all-access)"));
+    }
     let target = std::env::current_dir()?;
 
     let resume_index = args.iter().position(|a| a == "--resume").and_then(|pos| {
@@ -83,6 +89,8 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    let session_permissions = agent::SessionPermissions::new();
 
     let (mut conversation, mut session_path) = if let Some(path) = resume_path {
         let history = session::load(&path)?;
@@ -416,18 +424,17 @@ async fn main() -> Result<()> {
                             } else {
                                 let detail = tool_summary(name, input);
                                 let emoji = tool_emoji(name);
-                                if detail.is_empty() {
-                                    s.push_output(format!("{emoji} {name}"));
-                                } else {
-                                    s.push_output(format!("{emoji} {name}({detail})"));
-                                }
+                                s.push_tool_call(name, &detail, emoji);
                                 if cb_verbose {
                                     s.push_output(format!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default()));
                                 }
                             }
                         }
-                        llm_code_sdk::tools::ToolEvent::ToolResult { name, success, output } => {
+                        llm_code_sdk::tools::ToolEvent::ToolResult { name, success, output, metadata } => {
                             s.throbber_state = 1;
+
+                            // Update tool call record with result data
+                            s.update_tool_result(name, output.clone(), metadata.as_ref());
 
                             // Detect background bash processes — send to main loop for async spawn
                             if name == "bash" && output.contains("\"background\"") {
@@ -524,12 +531,17 @@ async fn main() -> Result<()> {
                     &instruction,
                     &target,
                     callback,
-                    survey_cb,
+                    agent::PermissionCallbacks {
+                        bash: survey_cb.clone(),
+                        write: survey_cb,
+                    },
                     &mut conversation,
                     Arc::clone(&cancelled),
                     model,
                     effort,
                     Some(spawn),
+                    sandbox_mode,
+                    &session_permissions,
                 );
 
                 // Race agent against interrupt events.
@@ -549,7 +561,7 @@ async fn main() -> Result<()> {
                                 }
                                 Some(AppEvent::Submit(msg)) => {
                                     let mut s = agent_state.lock().unwrap();
-                                    s.push_output(format!("  \x1b[2m(queued: {msg})\x1b[0m"));
+                                    s.push_ansi(format!("  \x1b[2m(queued: {msg})\x1b[0m"));
                                     s.queued_messages.push(msg);
                                 }
                                 None => break,
@@ -684,7 +696,7 @@ async fn main() -> Result<()> {
                                                 for line in text.lines() {
                                                     if !line.is_empty() {
                                                         let mut s = out_state.lock().unwrap();
-                                                        s.push_output(format!("  \x1b[2m[#{job_id}]\x1b[0m {line}"));
+                                                        s.push_ansi(format!("  \x1b[2m[#{job_id}]\x1b[0m {line}"));
                                                     }
                                                 }
                                             }
@@ -698,7 +710,7 @@ async fn main() -> Result<()> {
                                                 for line in text.lines() {
                                                     if !line.is_empty() {
                                                         let mut s = out_state.lock().unwrap();
-                                                        s.push_output(format!("  \x1b[2m[#{job_id}]\x1b[0m {line}"));
+                                                        s.push_ansi(format!("  \x1b[2m[#{job_id}]\x1b[0m {line}"));
                                                     }
                                                 }
                                             }

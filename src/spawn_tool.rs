@@ -81,7 +81,7 @@ impl Tool for SpawnTool {
         let state = Arc::clone(&self.app_state);
         let progress: crate::subagent::ProgressCallback = Arc::new(move |task_name, status| {
             let mut s = state.lock().unwrap();
-            s.push_output(format!("  \x1b[2m[{}] {}\x1b[0m", &task_name[..task_name.len().min(20)], status));
+            s.push_ansi(format!("  \x1b[2m[{}] {}\x1b[0m", &task_name[..task_name.len().min(20)], status));
         });
 
         match crate::subagent::run(&full_task, &self.project_root, model, Some(progress)).await {
