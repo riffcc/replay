@@ -7,7 +7,7 @@ use llm_code_sdk::{
     SkillResourceTool, SystemPrompt, Tool, ToolRunner, ToolRunnerConfig,
 };
 use llm_code_sdk::tools::{
-    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, SurveyOption, SurveyRequest,
+    BashTool, GrepTool, SearchTool, SurveyOption, SurveyRequest,
     SurveyTool, TasksTool, ToolEvent, ToolEventCallback,
 };
 use llm_code_sdk::tools::smart::{SmartReadTool, SmartWriteTool};
@@ -554,9 +554,7 @@ fn create_tools(
 
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(reader),
-        Arc::new(GlobTool::new(project_root)),
         Arc::new(GrepTool::new(project_root)),
-        Arc::new(ListDirectoryTool::new(project_root)),
         Arc::new(SearchTool::new(project_root)),
         Arc::new(SurveyTool::with_callback(permission_callbacks.bash.clone())),
     ];

@@ -13,8 +13,7 @@ use llm_code_sdk::{
     SystemPrompt, Tool, ToolRunner, ToolRunnerConfig,
 };
 use llm_code_sdk::tools::{
-    BashTool, GlobTool, GrepTool, ListDirectoryTool, SearchTool, TasksTool,
-    ToolEvent, ToolEventCallback,
+    BashTool, GrepTool, SearchTool, TasksTool, ToolEvent, ToolEventCallback,
 };
 use llm_code_sdk::tools::smart::{SmartReadTool, SmartWriteTool};
 
@@ -62,9 +61,7 @@ pub async fn run(
         Arc::new(reader),
         Arc::new(writer),
         Arc::new(BashTool::new(project_root).with_timeout(30)),
-        Arc::new(GlobTool::new(project_root)),
         Arc::new(GrepTool::new(project_root)),
-        Arc::new(ListDirectoryTool::new(project_root)),
         Arc::new(SearchTool::new(project_root)),
         Arc::new(TasksTool::new(project_root)),
     ];

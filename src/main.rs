@@ -790,35 +790,53 @@ fn tool_summary(name: &str, input: &std::collections::HashMap<String, serde_json
             if cmd.len() > 80 { format!("{}...", &cmd[..77]) } else { cmd }
         }
         "read" => {
-            let path = s("path");
             // Batch reads
             if let Some(reads) = input.get("reads").and_then(|v| v.as_array()) {
                 let paths: Vec<&str> = reads.iter()
                     .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
                     .collect();
                 return if paths.len() <= 3 {
-                    paths.join(", ")
+                    format!("batch: {}", paths.join(", "))
                 } else {
-                    format!("{}, ... +{} more", paths[..2].join(", "), paths.len() - 2)
+                    format!("batch: {}, ... +{} more", paths[..2].join(", "), paths.len() - 2)
                 };
             }
+
+            if input.get("codebase").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let dir_layer = s("directory_layer");
+                return if dir_layer.is_empty() || dir_layer == "summary" {
+                    "codebase:summary".to_string()
+                } else {
+                    format!("codebase:{dir_layer}")
+                };
+            }
+
+            let path = s("path");
             if path.is_empty() {
-                // Codebase read or other no-path variant
-                if input.get("codebase").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    return "codebase".to_string();
-                }
                 return String::new();
             }
-            let mut parts = vec![path];
-            let symbol = s("symbol");
-            if !symbol.is_empty() {
-                parts.push(format!(":{symbol}"));
+
+            if let Some(dir_layer) = input.get("directory_layer").and_then(|v| v.as_str()) {
+                return format!("directory:{dir_layer} {path}");
             }
-            let layer = s("layer");
-            if !layer.is_empty() && layer != "ast" {
-                parts.push(format!("[{layer}]"));
+
+            let mut label = if let Some(layer) = input.get("layer").and_then(|v| v.as_str()) {
+                if layer == "ast" {
+                    "file".to_string()
+                } else {
+                    format!("file:{layer}")
+                }
+            } else if input.get("symbol").and_then(|v| v.as_str()).is_some() {
+                "symbol".to_string()
+            } else {
+                "file".to_string()
+            };
+
+            if !s("symbol").is_empty() {
+                label = format!("{label}:{}", s("symbol"));
             }
-            parts.join("")
+
+            format!("{label} {path}")
         }
         "write" => s("path"),
         "grep" => s("pattern"),
