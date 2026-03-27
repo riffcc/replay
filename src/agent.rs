@@ -537,7 +537,7 @@ Respond with a brief summary of what you changed and why."#,
 
 /// Create the tool set for the agent.
 /// Return type includes the process registry handle for the host.
-fn create_tools(
+async fn create_tools(
     project_root: &Path,
     skill_registry: &Arc<RwLock<SkillRegistry>>,
     permission_callbacks: PermissionCallbacks,
@@ -596,7 +596,7 @@ fn create_tools(
         tools.push(Arc::new(SkillResourceTool::new(Arc::clone(skill_registry))));
     }
 
-    let mcp_tools = llm_code_sdk::tools::mcp::connect_servers(&llm_code_sdk::tools::mcp::builtin_servers());
+    let mcp_tools = llm_code_sdk::tools::mcp::connect_servers(&llm_code_sdk::tools::mcp::builtin_servers()).await;
     tools.extend(mcp_tools);
 
     (tools, process_registry)
@@ -695,7 +695,6 @@ pub async fn execute(
         let local_skills = project_root.join(".replay").join("skills");
         reg.discover(&local_skills);
     }
-
     let (tools, process_registry) = create_tools(
         project_root,
         &skill_registry,
@@ -703,7 +702,7 @@ pub async fn execute(
         spawn_tool,
         sandbox_mode,
         session_permissions,
-    );
+    ).await;
 
     let config = ToolRunnerConfig {
         max_iterations: Some(50),
@@ -765,7 +764,8 @@ pub async fn solve(issue: &Issue, project_root: &Path, model: &ModelDef) -> Resu
         None,
         SandboxMode::DangerousAllAccess,
         &session_permissions,
-    );
+    )
+    .await;
 
     let on_event: ToolEventCallback = Arc::new(|event| match &event {
         ToolEvent::Text { text } => tracing::info!("{text}"),
