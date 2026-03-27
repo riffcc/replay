@@ -38,6 +38,8 @@ pub struct ToolCallRecord {
     pub diffstat: Option<(usize, usize)>,
     /// Diff lines from metadata (unified-style: +added, -removed, context).
     pub diff: Option<Vec<String>>,
+    /// Full metadata from ToolResult.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Wrap a string to a given width with word-boundary reflow.
@@ -594,6 +596,7 @@ impl AppState {
             output: None,
             diffstat: None,
             diff: None,
+            metadata: None,
         });
         self.scroll_offset = 0;
     }
@@ -609,6 +612,7 @@ impl AppState {
         };
 
         record.output = Some(output);
+        record.metadata = metadata.cloned();
 
         // Extract diffstat and diff hunks from metadata
         if let Some(meta) = metadata {
@@ -991,9 +995,83 @@ impl AppState {
             _ => return,
         };
 
-        // Non-write tools: generic display
+        // Read tool: show code content with line numbers
+        if record.name == "read" {
+            let line_count = record.metadata.as_ref()
+                .and_then(|m| m.get("lines")).and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let layer = record.metadata.as_ref()
+                .and_then(|m| m.get("layer")).and_then(|v| v.as_str())
+                .unwrap_or("raw");
+            let code_style = Style::default().fg(Color::Green);
+
+            // Extract just the code content (skip headers/separators)
+            let lines: Vec<&str> = output.lines().collect();
+            let display_limit = 30;
+            let mut in_code = false;
+            let mut code_lines: Vec<&str> = Vec::new();
+
+            for line in &lines {
+                if line.starts_with("```") {
+                    in_code = !in_code;
+                    continue;
+                }
+                if in_code {
+                    code_lines.push(line);
+                }
+            }
+
+            // If no fenced code found, show the raw output lines
+            if code_lines.is_empty() {
+                code_lines = lines.iter()
+                    .filter(|l| !l.starts_with("───") && !l.starts_with("##") && !l.is_empty())
+                    .copied()
+                    .collect();
+            }
+
+            let num_width = if code_lines.is_empty() { 1 } else {
+                format!("{}", code_lines.len()).len()
+            };
+
+            // Header
+            let header = format!("{layer} · {line_count} lines");
+            let header_line = Line::from(vec![
+                Span::styled(format!("  {bar} "), dim),
+                Span::styled(header, dim),
+            ]);
+            self.output.push(OutputLine {
+                content: format!("  {bar} {layer} · {line_count} lines"),
+                styled: Some(header_line.spans),
+            });
+
+            for (j, line) in code_lines.iter().enumerate().take(display_limit) {
+                let line_no = j + 1;
+                let styled_line = Line::from(vec![
+                    Span::styled(format!("  {bar} "), dim),
+                    Span::styled(format!("{:>w$}", line_no, w = num_width), dim),
+                    Span::styled(" \u{2502} ", dim),
+                    Span::styled(line.to_string(), code_style),
+                ]);
+                let plain = format!("  {bar} {:>w$} \u{2502} {line}", line_no, w = num_width);
+                self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+            }
+
+            if code_lines.len() > display_limit {
+                let remaining = code_lines.len() - display_limit;
+                let truncated = Line::from(vec![
+                    Span::styled(format!("  {bar} "), dim),
+                    Span::styled(format!("... {remaining} more lines"), dim),
+                ]);
+                self.output.push(OutputLine {
+                    content: format!("  {bar} ... {remaining} more lines"),
+                    styled: Some(truncated.spans),
+                });
+            }
+            return;
+        }
+
+        // Generic tool: show output lines dimmed
         {
-            // Generic tool — just show output lines dimmed
             for line in output.lines().take(20) {
                 let styled_line = Line::from(vec![
                     Span::styled(format!("  {bar} "), dim),
