@@ -213,8 +213,7 @@ impl SandboxedBashTool {
 
             if !all_allowed {
                 let dirs: Vec<String> = outside_paths.iter()
-                    .filter_map(|p| Path::new(p).parent())
-                    .map(|d| d.display().to_string())
+                    .map(|p| p.to_string())
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
