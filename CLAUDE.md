@@ -1,6 +1,6 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
+This project uses the native **Tasks** tool for issue tracking whenever possible. The Tasks tool uses **bd** (beads) under the hood in this repo, so prefer native task tool calls first and use direct `bd` CLI commands as a fallback when the native tool cannot express the needed operation. Run `bd onboard` to get started if you need the CLI fallback.
 
 ## Quick Reference
 
@@ -11,6 +11,21 @@ bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
+
+## Task Tracking Preference
+
+- Prefer the native **Tasks** tool and native tool calls whenever possible
+- Use direct `bd` CLI commands as a fallback
+- Do not use markdown TODO lists for project tracking
+- If there is a mismatch, treat Tasks as the preferred interface and beads as the backing store
+
+## Tooling Preference
+
+- Prefer native structured developer tools over ad hoc shell commands when possible
+- Prefer **Read** for inspecting code and files instead of shelling out to `sed`, `cat`, or one-off Python readers
+- **Read can be used on files anywhere on the machine**, not just inside the current repo, so prefer it for SmartRead-style inspection of sibling projects such as `~/projects/llm-code-sdk`
+- Use `search`, `grep`, `glob`, and `list_directory` for discovery before falling back to shell exploration
+- Reserve shell commands primarily for builds, tests, git, repo-specific CLIs, and cases where the native tools cannot express the needed operation cleanly
 
 ## Non-Interactive Shell Commands
 
@@ -39,7 +54,7 @@ cp -rf source dest          # NOT: cp -r source dest
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses **bd (beads)** as the backing store for task tracking. Prefer the native **Tasks** tool first; run `bd prime` to see full workflow context and commands when you need the CLI fallback.
 
 ### Quick Reference
 
@@ -52,7 +67,9 @@ bd close <id>         # Complete work
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Prefer the native **Tasks** tool for task tracking whenever possible
+- Use direct `bd` commands as a fallback when the native tool cannot perform the required action
+- Do NOT use markdown TODO lists for task tracking
 - Run `bd prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 
