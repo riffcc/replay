@@ -164,14 +164,25 @@ impl SandboxedBashTool {
     }
 
     /// Extract absolute paths from command arguments that fall outside the project root.
+    /// Only examines the command portion before heredocs or quoted bodies.
     fn cross_root_paths(&self, command: &str) -> Vec<String> {
-        command.split_whitespace()
-            .filter(|arg| arg.starts_with('/'))
+        // Truncate at heredoc markers to avoid parsing script bodies
+        let cmd_part = if let Some(pos) = command.find("<<") {
+            &command[..pos]
+        } else {
+            command
+        };
+
+        cmd_part.split_whitespace()
+            .filter(|arg| arg.starts_with('/') && arg.len() > 1) // skip bare "/"
             .filter(|arg| {
-                let p = Path::new(arg);
+                // Must look like a filesystem path, not a flag or operator
+                let clean = arg.trim_matches(|c: char| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
+                if clean.len() <= 1 { return false; }
+                let p = Path::new(clean);
                 !p.starts_with(&self.project_root)
             })
-            .map(|s| s.to_string())
+            .map(|s| s.trim_matches(|c: char| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(').to_string())
             .collect()
     }
 
