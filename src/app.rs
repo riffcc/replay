@@ -23,6 +23,22 @@ pub struct OutputLine {
     pub styled: Option<Vec<Span<'static>>>,
 }
 
+/// Dim a color by blending it toward gray (for context lines in diffs).
+fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => {
+            // Blend 60% toward gray
+            let gray: u8 = 100;
+            Color::Rgb(
+                ((r as u16 * 40 + gray as u16 * 60) / 100) as u8,
+                ((g as u16 * 40 + gray as u16 * 60) / 100) as u8,
+                ((b as u16 * 40 + gray as u16 * 60) / 100) as u8,
+            )
+        }
+        _ => Color::DarkGray,
+    }
+}
+
 /// Stored metadata for a tool call, used for expanded view.
 #[derive(Clone, Debug)]
 pub struct ToolCallRecord {
@@ -421,6 +437,8 @@ pub struct AppState {
     pub tool_calls: Vec<ToolCallRecord>,
     /// Expanded output view (Ctrl+O toggle).
     pub expanded_view: bool,
+    /// Syntax highlighter for expanded view.
+    pub highlighter: crate::highlight::Highlighter,
     /// Token rate tracking for animation.
     pub last_token_update: std::time::Instant,
     pub token_rate: f64,        // tokens per second (smoothed)
@@ -466,6 +484,7 @@ impl AppState {
             pending_insert: None,
             tool_calls: Vec::new(),
             expanded_view: false,
+            highlighter: crate::highlight::Highlighter::new(),
             model_name: String::new(),
             selected_model_id: String::new(),
             reasoning_effort: None,
@@ -902,6 +921,8 @@ impl AppState {
 
                 let max_line = entries.iter().map(|e| e.line_no).max().unwrap_or(1);
                 let num_width = format!("{max_line}").len();
+                let ext = crate::highlight::extension_from_path(&record.detail);
+                let hl = &self.highlighter;
 
                 // Group consecutive -/+ blocks for inline diffing
                 let mut i = 0;
@@ -909,15 +930,24 @@ impl AppState {
                     let e = &entries[i];
 
                     if e.op == " " {
-                        // Context line
-                        let styled_line = Line::from(vec![
+                        // Context line — syntax highlighted but dimmed
+                        let mut spans = vec![
                             Span::styled(format!("  {bar} "), dim),
                             Span::styled(format!("{:>w$}", e.line_no, w = num_width), dim),
                             Span::styled("   ", dim),
-                            Span::styled(e.text.clone(), dim),
-                        ]);
+                        ];
+                        // Dim the syntax colors for context
+                        for mut span in hl.highlight_line(&e.text, ext, None) {
+                            if let Some(fg) = span.style.fg {
+                                // Desaturate: blend toward gray
+                                span.style = span.style.fg(dim_color(fg));
+                            } else {
+                                span.style = dim;
+                            }
+                            spans.push(span);
+                        }
                         let plain = format!("  {bar} {:>w$}   {}", e.line_no, e.text, w = num_width);
-                        self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                        self.output.push(OutputLine { content: plain, styled: Some(spans) });
                         i += 1;
                         continue;
                     }
@@ -950,15 +980,15 @@ impl AppState {
                             let plain = format!("  {bar} {:>w$} - {}", r.line_no, r.text, w = num_width);
                             self.output.push(OutputLine { content: plain, styled: Some(spans) });
                         } else {
-                            // Unpaired removed: highlight whole line
-                            let styled_line = Line::from(vec![
+                            // Unpaired removed: syntax highlighted with red background
+                            let mut spans = vec![
                                 Span::styled(format!("  {bar} "), dim),
                                 Span::styled(format!("{:>w$}", r.line_no, w = num_width), red),
                                 Span::styled(" - ", red),
-                                Span::styled(r.text.clone(), red_bg),
-                            ]);
+                            ];
+                            spans.extend(hl.highlight_diff_line(&r.text, ext, Color::Rgb(40, 0, 0)));
                             let plain = format!("  {bar} {:>w$} - {}", r.line_no, r.text, w = num_width);
-                            self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                            self.output.push(OutputLine { content: plain, styled: Some(spans) });
                         }
                     }
 
@@ -974,15 +1004,15 @@ impl AppState {
                             let plain = format!("  {bar} {:>w$} + {}", a.line_no, a.text, w = num_width);
                             self.output.push(OutputLine { content: plain, styled: Some(spans) });
                         } else {
-                            // Unpaired added: highlight whole line
-                            let styled_line = Line::from(vec![
+                            // Unpaired added: syntax highlighted with green background
+                            let mut spans = vec![
                                 Span::styled(format!("  {bar} "), dim),
                                 Span::styled(format!("{:>w$}", a.line_no, w = num_width), green),
                                 Span::styled(" + ", green),
-                                Span::styled(a.text.clone(), green_bg),
-                            ]);
+                            ];
+                            spans.extend(hl.highlight_diff_line(&a.text, ext, Color::Rgb(0, 40, 0)));
                             let plain = format!("  {bar} {:>w$} + {}", a.line_no, a.text, w = num_width);
-                            self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                            self.output.push(OutputLine { content: plain, styled: Some(spans) });
                         }
                     }
                 }
@@ -1003,7 +1033,8 @@ impl AppState {
             let layer = record.metadata.as_ref()
                 .and_then(|m| m.get("layer")).and_then(|v| v.as_str())
                 .unwrap_or("raw");
-            let code_style = Style::default();
+            let ext = crate::highlight::extension_from_path(&record.detail);
+            let hl = &self.highlighter;
 
             // Extract just the code content (skip headers/separators)
             let lines: Vec<&str> = output.lines().collect();
@@ -1046,14 +1077,14 @@ impl AppState {
 
             for (j, line) in code_lines.iter().enumerate().take(display_limit) {
                 let line_no = j + 1;
-                let styled_line = Line::from(vec![
+                let mut spans = vec![
                     Span::styled(format!("  {bar} "), dim),
                     Span::styled(format!("{:>w$}", line_no, w = num_width), dim),
                     Span::styled(" \u{2502} ", dim),
-                    Span::styled(line.to_string(), code_style),
-                ]);
+                ];
+                spans.extend(hl.highlight_line(line, ext, None));
                 let plain = format!("  {bar} {:>w$} \u{2502} {line}", line_no, w = num_width);
-                self.output.push(OutputLine { content: plain, styled: Some(styled_line.spans) });
+                self.output.push(OutputLine { content: plain, styled: Some(spans) });
             }
 
             if code_lines.len() > display_limit {

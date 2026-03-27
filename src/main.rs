@@ -11,6 +11,7 @@ mod markdown;
 mod models;
 mod display;
 mod engine;
+mod highlight;
 mod session;
 mod process_manager;
 mod spawn_tool;
