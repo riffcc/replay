@@ -1377,6 +1377,10 @@ impl App {
                     continue;
                 }
 
+                    let prefix_width: usize = 2;
+                    let input_content_width = crossterm::terminal::size()
+                        .map(|(w, _)| w.saturating_sub(2) as usize)
+                        .unwrap_or(78);
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if !self.input_buffer.is_empty() {
@@ -1491,6 +1495,22 @@ impl App {
                                 }
                             }
                         }
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.input_cursor = move_to_segment_start(
+                                &self.input_buffer,
+                                self.input_cursor,
+                                input_content_width,
+                                prefix_width,
+                            );
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.input_cursor = move_to_segment_end(
+                                &self.input_buffer,
+                                self.input_cursor,
+                                input_content_width,
+                                prefix_width,
+                            );
+                        }
                         KeyCode::Char(c) => {
                             self.input_buffer.insert(self.input_cursor, c);
                             self.input_cursor += c.len_utf8();
@@ -1509,21 +1529,17 @@ impl App {
                                 self.input_buffer.remove(self.input_cursor);
                             }
                         }
+                        KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                            self.input_cursor = move_word_left(&self.input_buffer, self.input_cursor);
+                        }
+                        KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                            self.input_cursor = move_word_right(&self.input_buffer, self.input_cursor);
+                        }
                         KeyCode::Left => {
-                            if self.input_cursor > 0 {
-                                self.input_cursor -= 1;
-                                while self.input_cursor > 0 && !self.input_buffer.is_char_boundary(self.input_cursor) {
-                                    self.input_cursor -= 1;
-                                }
-                            }
+                            self.input_cursor = prev_char_boundary(&self.input_buffer, self.input_cursor);
                         }
                         KeyCode::Right => {
-                            if self.input_cursor < self.input_buffer.len() {
-                                self.input_cursor += 1;
-                                while self.input_cursor < self.input_buffer.len() && !self.input_buffer.is_char_boundary(self.input_cursor) {
-                                    self.input_cursor += 1;
-                                }
-                            }
+                            self.input_cursor = next_char_boundary(&self.input_buffer, self.input_cursor);
                         }
                         KeyCode::Tab => {
                             // Complete first matching slash command
@@ -1604,17 +1620,17 @@ impl App {
     fn render(&self, frame: &mut Frame) {
         let state = self.state.lock().unwrap();
 
-        // Input area height: account for soft-wrapping within each line
+        // Input area height: account for soft-wrapping within each line.
+        // The first visual segment of each hard line includes the prompt/indent prefix,
+        // but wrapped continuation segments do not. We use the same model here and for
+        // cursor positioning so multiline input stays visually aligned.
         let prefix_width: u16 = 2; // "› " or "  "
-        let input_content_width = (frame.area().width as usize).saturating_sub(prefix_width as usize + 1);
-        let input_line_count: usize = if input_content_width == 0 {
-            self.input_buffer.matches('\n').count() + 1
-        } else {
-            self.input_buffer.split('\n').map(|line| {
-                let clen = line.chars().count();
-                if clen == 0 { 1 } else { (clen + input_content_width - 1) / input_content_width }
-            }).sum()
-        };
+        let input_content_width = frame.area().width.saturating_sub(2) as usize;
+        let input_line_count: usize = wrapped_input_line_count(
+            &self.input_buffer,
+            input_content_width,
+            prefix_width as usize,
+        );
         let input_height = (input_line_count as u16 + 2).max(3);
 
         // Layout: output, input, status bar
@@ -1866,11 +1882,16 @@ impl App {
             .wrap(Wrap { trim: false });
         frame.render_widget(input_text, input_area);
 
-        // Cursor position — account for soft-wrapping
-        let (visual_line, visual_col) = visual_cursor_position(
-            &self.input_buffer, self.input_cursor, input_content_width,
+        // Cursor position — account for soft-wrapping.
+        // The first visual segment of each hard line is prefixed, but soft-wrapped
+        // continuation segments are not, so only add the prefix on segment starts.
+        let (visual_line, visual_col, continuation) = visual_cursor_position(
+            &self.input_buffer,
+            self.input_cursor,
+            input_content_width,
+            prefix_width as usize,
         );
-        let cursor_x = input_area.x + prefix_width + visual_col as u16;
+        let cursor_x = input_area.x + if continuation { 0 } else { prefix_width } + visual_col as u16;
         let cursor_y = input_area.y + 1 + visual_line as u16;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 
@@ -2082,40 +2103,185 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
     }
 }
 
-/// Calculate (visual_line, visual_col) from buffer byte position,
-/// accounting for soft-wrapping at `wrap_width` characters.
-fn visual_cursor_position(buffer: &str, cursor: usize, wrap_width: usize) -> (usize, usize) {
-    let before = &buffer[..cursor.min(buffer.len())];
-    let mut visual_line: usize = 0;
-    let last_newline = before.rfind('\n');
-
-    // Count visual lines for all complete hard lines before cursor
-    if let Some(nl_pos) = last_newline {
-        for hard_line in buffer[..nl_pos + 1].split('\n') {
-            let clen = hard_line.chars().count();
-            if wrap_width > 0 && clen > 0 {
-                visual_line += (clen + wrap_width - 1) / wrap_width;
-            } else {
-                visual_line += 1;
-            }
-        }
-        // split('\n') on "foo\nbar\n" yields a trailing "" for the line after
-        // the last newline — subtract it since we count that via col_in_hard_line
-        visual_line = visual_line.saturating_sub(1);
+fn prev_char_boundary(buffer: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
     }
+    let mut next = cursor - 1;
+    while next > 0 && !buffer.is_char_boundary(next) {
+        next -= 1;
+    }
+    next
+}
 
-    // Column within the current hard line
-    let col_in_hard_line = match last_newline {
-        Some(p) => before[p + 1..].chars().count(),
-        None => before.chars().count(),
+fn next_char_boundary(buffer: &str, cursor: usize) -> usize {
+    if cursor >= buffer.len() {
+        return buffer.len();
+    }
+    let mut next = cursor + 1;
+    while next < buffer.len() && !buffer.is_char_boundary(next) {
+        next += 1;
+    }
+    next.min(buffer.len())
+}
+
+fn move_word_left(buffer: &str, cursor: usize) -> usize {
+    let mut pos = cursor;
+    while pos > 0 {
+        let prev = prev_char_boundary(buffer, pos);
+        let ch = buffer[prev..pos].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        pos = prev;
+    }
+    while pos > 0 {
+        let prev = prev_char_boundary(buffer, pos);
+        let ch = buffer[prev..pos].chars().next().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        pos = prev;
+    }
+    pos
+}
+
+fn move_word_right(buffer: &str, cursor: usize) -> usize {
+    let mut pos = cursor;
+    while pos < buffer.len() {
+        let next = next_char_boundary(buffer, pos);
+        let ch = buffer[pos..next].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        pos = next;
+    }
+    while pos < buffer.len() {
+        let next = next_char_boundary(buffer, pos);
+        let ch = buffer[pos..next].chars().next().unwrap();
+        pos = next;
+        if ch.is_whitespace() {
+            break;
+        }
+    }
+    pos
+}
+
+fn line_wrap_metrics(line_chars: usize, content_width: usize, prefix_width: usize) -> (usize, usize) {
+    let first_width = content_width.saturating_sub(prefix_width).max(1);
+    let continuation_width = content_width.max(1);
+    if line_chars <= first_width {
+        return (1, first_width);
+    }
+    let remaining = line_chars - first_width;
+    let continuation_lines = (remaining + continuation_width - 1) / continuation_width;
+    (1 + continuation_lines, first_width)
+}
+
+fn wrapped_input_line_count(buffer: &str, content_width: usize, prefix_width: usize) -> usize {
+    buffer.split('\n').map(|line| {
+        let char_count = line.chars().count();
+        line_wrap_metrics(char_count, content_width, prefix_width).0
+    }).sum::<usize>().max(1)
+}
+
+fn segment_bounds_for_cursor(
+    buffer: &str,
+    cursor: usize,
+    content_width: usize,
+    prefix_width: usize,
+) -> (usize, usize) {
+    let cursor = cursor.min(buffer.len());
+    let line_start = buffer[..cursor].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let line_end = buffer[cursor..].find('\n').map(|idx| cursor + idx).unwrap_or(buffer.len());
+    let line = &buffer[line_start..line_end];
+    let total_chars = line.chars().count();
+    let col_chars = buffer[line_start..cursor].chars().count();
+    let (_, first_width) = line_wrap_metrics(total_chars, content_width, prefix_width);
+    let continuation_width = content_width.max(1);
+
+    let segment_start_chars = if col_chars <= first_width {
+        0
+    } else {
+        let remainder = col_chars - first_width;
+        first_width + ((remainder - 1) / continuation_width) * continuation_width
+    };
+    let segment_end_chars = if segment_start_chars == 0 {
+        first_width.min(total_chars)
+    } else {
+        (segment_start_chars + continuation_width).min(total_chars)
     };
 
-    // Account for wrapping within the current hard line
-    if wrap_width > 0 && col_in_hard_line > 0 {
-        visual_line += col_in_hard_line / wrap_width;
-        (visual_line, col_in_hard_line % wrap_width)
+    let segment_start = if segment_start_chars == 0 {
+        line_start
     } else {
-        (visual_line, col_in_hard_line)
+        line_start + line.chars().take(segment_start_chars).map(|c| c.len_utf8()).sum::<usize>()
+    };
+    let segment_end = if segment_end_chars == 0 {
+        line_start
+    } else {
+        line_start + line.chars().take(segment_end_chars).map(|c| c.len_utf8()).sum::<usize>()
+    };
+    (segment_start, segment_end)
+}
+
+fn move_to_segment_start(buffer: &str, cursor: usize, content_width: usize, prefix_width: usize) -> usize {
+    let (segment_start, _) = segment_bounds_for_cursor(buffer, cursor, content_width, prefix_width);
+    if cursor == segment_start && segment_start > 0 {
+        let prev = prev_char_boundary(buffer, segment_start);
+        let (prev_segment_start, _) = segment_bounds_for_cursor(buffer, prev, content_width, prefix_width);
+        prev_segment_start
+    } else {
+        segment_start
+    }
+}
+
+fn move_to_segment_end(buffer: &str, cursor: usize, content_width: usize, prefix_width: usize) -> usize {
+    let (_, segment_end) = segment_bounds_for_cursor(buffer, cursor, content_width, prefix_width);
+    if cursor == segment_end && segment_end < buffer.len() {
+        let next = next_char_boundary(buffer, segment_end);
+        let (_, next_segment_end) = segment_bounds_for_cursor(buffer, next, content_width, prefix_width);
+        next_segment_end
+    } else {
+        segment_end
+    }
+}
+
+/// Calculate (visual_line, visual_col, continuation_segment) from buffer byte position,
+/// accounting for prefixed first segments and full-width wrapped continuations.
+fn visual_cursor_position(
+    buffer: &str,
+    cursor: usize,
+    content_width: usize,
+    prefix_width: usize,
+) -> (usize, usize, bool) {
+    let cursor = cursor.min(buffer.len());
+    let before = &buffer[..cursor];
+    let last_newline = before.rfind('\n');
+    let mut visual_line = 0usize;
+
+    let preceding = match last_newline {
+        Some(nl_pos) => &buffer[..nl_pos],
+        None => "",
+    };
+    if !preceding.is_empty() {
+        for hard_line in preceding.split('\n') {
+            visual_line += line_wrap_metrics(hard_line.chars().count(), content_width, prefix_width).0;
+        }
+    }
+
+    let current_line_start = last_newline.map(|idx| idx + 1).unwrap_or(0);
+    let current_hard_line = &buffer[current_line_start..cursor];
+    let col_in_hard_line = current_hard_line.chars().count();
+    let continuation_width = content_width.max(1);
+    let (_, first_width) = line_wrap_metrics(current_hard_line.chars().count(), content_width, prefix_width);
+
+    if col_in_hard_line <= first_width {
+        (visual_line, col_in_hard_line, false)
+    } else {
+        let remainder = col_in_hard_line - first_width;
+        visual_line += 1 + (remainder / continuation_width);
+        (visual_line, remainder % continuation_width, true)
     }
 }
 
