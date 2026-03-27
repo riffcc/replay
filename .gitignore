@@ -10,3 +10,4 @@
 
 /target
 synthesis/
+.replay/settings.toml
