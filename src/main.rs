@@ -788,7 +788,37 @@ fn tool_summary(name: &str, input: &std::collections::HashMap<String, serde_json
             let cmd = s("command");
             if cmd.len() > 80 { format!("{}...", &cmd[..77]) } else { cmd }
         }
-        "read" => s("path"),
+        "read" => {
+            let path = s("path");
+            // Batch reads
+            if let Some(reads) = input.get("reads").and_then(|v| v.as_array()) {
+                let paths: Vec<&str> = reads.iter()
+                    .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
+                    .collect();
+                return if paths.len() <= 3 {
+                    paths.join(", ")
+                } else {
+                    format!("{}, ... +{} more", paths[..2].join(", "), paths.len() - 2)
+                };
+            }
+            if path.is_empty() {
+                // Codebase read or other no-path variant
+                if input.get("codebase").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return "codebase".to_string();
+                }
+                return String::new();
+            }
+            let mut parts = vec![path];
+            let symbol = s("symbol");
+            if !symbol.is_empty() {
+                parts.push(format!(":{symbol}"));
+            }
+            let layer = s("layer");
+            if !layer.is_empty() && layer != "ast" {
+                parts.push(format!("[{layer}]"));
+            }
+            parts.join("")
+        }
         "write" => s("path"),
         "grep" => s("pattern"),
         "glob" => s("pattern"),
