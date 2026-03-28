@@ -1,15 +1,15 @@
-//! Subagents — background agent instances that run tasks independently.
+//! Subagents — agent instances that share the main output stream.
 //!
-//! A subagent gets its own conversation, tools, and execution context.
-//! It runs in the background and returns a summary when done.
-//! No output to the main stream — just a status update on completion.
+//! A subagent gets its own conversation and tools but its tool events
+//! route through the same display callback as the main agent.
+//! From the user's perspective, it's just the agent doing more work.
 
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use llm_code_sdk::{
-    ApiFormat, Client, MessageCreateParams, MessageParam, SkillRegistry,
+    Client, MessageCreateParams, MessageParam,
     SystemPrompt, Tool, ToolRunner, ToolRunnerConfig,
 };
 use llm_code_sdk::tools::{
@@ -28,16 +28,15 @@ pub struct SubagentResult {
     pub tool_calls: usize,
 }
 
-/// Progress callback for subagent status updates.
-pub type ProgressCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
-
 /// Spawn and run a subagent for a given task.
-/// Returns a summary of what it did.
+///
+/// `on_event` is the same callback the main agent uses — subagent tool
+/// calls appear in the main stream identically to the main agent's.
 pub async fn run(
     task: &str,
     project_root: &Path,
     model: &ModelDef,
-    on_progress: Option<ProgressCallback>,
+    on_event: ToolEventCallback,
 ) -> Result<SubagentResult> {
     let api_key = crate::models::resolve_auth(model)
         .context(format!("no API key for {} ({})", model.name, model.provider))?;
@@ -66,27 +65,22 @@ pub async fn run(
         Arc::new(TasksTool::new(project_root)),
     ];
 
+    // Count tool calls via the shared callback
     let tool_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tool_count_clone = Arc::clone(&tool_count);
-    let task_name = task.to_string();
-    let progress = on_progress.clone();
 
-    let on_event: ToolEventCallback = Arc::new(move |event| {
-        match &event {
-            ToolEvent::ToolCall { name, .. } => {
-                tool_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(cb) = &progress {
-                    cb(&task_name, &format!("→ {name}"));
-                }
-            }
-            _ => {}
+    let wrapped_callback: ToolEventCallback = Arc::new(move |event| {
+        if matches!(&event, ToolEvent::ToolCall { .. }) {
+            tool_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // Route everything through the main display callback
+        on_event(event);
     });
 
     let config = ToolRunnerConfig {
         max_iterations: Some(30),
         verbose: false,
-        on_event: Some(on_event),
+        on_event: Some(wrapped_callback),
         ..Default::default()
     };
 
