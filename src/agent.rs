@@ -602,6 +602,7 @@ async fn create_tools(
     (tools, process_registry)
 }
 
+
 /// Discover agent skills and load AGENTS.md into the system prompt.
 fn build_system_prompt(
     project_root: &Path,
@@ -726,6 +727,8 @@ pub async fn execute(
         ..Default::default()
     };
 
+    let mem_report = crate::mem::RunMemReport::start(project_root, history.len(), &params.messages);
+
     let response = runner.run(params).await.context("agent run failed")?;
     let text = response
         .text()
@@ -733,6 +736,7 @@ pub async fn execute(
         .to_string();
 
     history.push(MessageParam::assistant(&text));
+    let _ = mem_report.finish(history.len(), history, &text);
     Ok((text, process_registry))
 }
 
