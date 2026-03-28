@@ -9,11 +9,16 @@ mod compact;
 mod config;
 mod coordinator;
 mod markdown;
+mod mem;
+mod light_tools;
+
 mod models;
 mod display;
 mod engine;
 mod highlight;
 mod session;
+mod skills;
+
 mod process_manager;
 mod provider_pressure;
 mod spawn_tool;
@@ -523,11 +528,12 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Create spawn tool for subagents
+                // Create spawn tool — subagents use the same display callback
                 let spawn = Arc::new(spawn_tool::SpawnTool::new(
                     &target,
                     Arc::new(Mutex::new(model_id.clone())),
                     Arc::clone(&state),
+                    Arc::clone(&callback),
                 )) as Arc<dyn llm_code_sdk::Tool>;
 
                 let agent_future = agent::execute(

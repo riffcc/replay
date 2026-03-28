@@ -659,22 +659,50 @@ impl AppState {
             }
         }
 
-        // Rewrite the raw entry with diffstat appended
-        if let Some((added, removed)) = record.diffstat {
-            let emoji = match record.name.as_str() {
-                "write" => "\u{1F4DD}",
-                _ => return,
-            };
-            let detail = record.detail.clone();
-            let new_line = if detail.is_empty() {
-                format!("{emoji} {name} \x1b[32m+{added}\x1b[0m \x1b[31m-{removed}\x1b[0m")
-            } else {
-                format!("{emoji} {name}({detail}) \x1b[32m+{added}\x1b[0m \x1b[31m-{removed}\x1b[0m")
+        // Rewrite the raw entry with rich info for write tools
+        if record.name == "write" {
+            let emoji = "\u{1F4DD}";
+            let path = record.detail.clone();
+
+            // Extract metadata fields
+            let meta = record.metadata.as_ref();
+            let summary = meta.and_then(|m| m.get("summary")).and_then(|v| v.as_str()).unwrap_or("");
+            let reason = meta.and_then(|m| m.get("reason")).and_then(|v| v.as_str()).unwrap_or("");
+            let operation = meta.and_then(|m| m.get("operation")).and_then(|v| v.as_str()).unwrap_or("write");
+
+            // Operation label: human words, no underscores
+            let op_word = match operation {
+                "write" => "create",
+                "overwrite" => "overwrite",
+                "replace" | "replace_function" | "replace_symbol" | "replace_lines" => "edit",
+                "delete" => "delete",
+                "insert_after" => "edit",
+                "edit" => "edit",
+                _ => "write",
             };
 
+            let diffstat = match record.diffstat {
+                Some((a, r)) => format!(" \x1b[32m+{a}\x1b[0m \x1b[31m-{r}\x1b[0m"),
+                None => String::new(),
+            };
+
+            // Main line: 📝 edit src/app.rs +5 -3
+            let mut parts = Vec::new();
+            parts.push(format!("{emoji} {op_word} {path}{diffstat}"));
+
+            // Subline: the auto-summary from tree-sitter / compound edit
+            if !summary.is_empty() {
+                parts.push(format!("  \x1b[2m{summary}\x1b[0m"));
+            }
+
+            // Reason from the model
+            if !reason.is_empty() {
+                parts.push(format!("  \x1b[2m\x1b[3m\u{21B3} {reason}\x1b[0m"));
+            }
+
+            let new_line = parts.join("\n");
             let raw_idx = record.raw_index;
             self.raw_output[raw_idx] = RawEntry::Ansi(new_line);
-            // Full rewrap to update display
             self.rewrap(self.term_width);
         }
     }
@@ -933,6 +961,19 @@ impl AppState {
                 let mut i = 0;
                 while i < entries.len() {
                     let e = &entries[i];
+
+                    if e.op == "..." {
+                        // Gap marker between hunks
+                        let spans = vec![
+                            Span::styled(format!("  {bar} "), dim),
+                            Span::styled(format!("{:>w$}", "~", w = num_width), dim),
+                            Span::styled("   \u{2504}\u{2504}\u{2504}", dim), // ┄┄┄
+                        ];
+                        let plain = format!("  {bar} {:>w$}   ┄┄┄", "~", w = num_width);
+                        self.output.push(OutputLine { content: plain, styled: Some(spans) });
+                        i += 1;
+                        continue;
+                    }
 
                     if e.op == " " {
                         // Context line — syntax highlighted but dimmed
