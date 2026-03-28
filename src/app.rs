@@ -396,6 +396,9 @@ pub struct AppState {
     pub show_model: bool,
     pub show_context: bool,
     pub show_project: bool,
+    pub show_rates: bool,
+    /// Active provider-pressure snapshot for the selected route.
+    pub provider_pressure: Option<crate::provider_pressure::ProviderPressureSnapshot>,
     /// Model name.
     pub model_name: String,
     /// Currently selected model ID (for agent::execute).
@@ -468,6 +471,8 @@ impl AppState {
             show_model: false,
             show_context: true,
             show_project: true,
+            show_rates: false,
+            provider_pressure: None,
             couch_mode: false,
             couch_mode_notify: 0,
             recording: false,
@@ -1203,6 +1208,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model or toggle model display"),
     ("/project", "Toggle project path display"),
     ("/ps", "Show background terminals"),
+    ("/rates", "Toggle provider pressure display"),
     ("/usage", "Toggle token usage display"),
 ];
 
@@ -2563,6 +2569,11 @@ impl App {
             "/usage" => {
                 let mut s = self.state.lock().unwrap();
                 s.show_usage = !s.show_usage;
+                true
+            }
+            "/rates" => {
+                let mut s = self.state.lock().unwrap();
+                s.show_rates = !s.show_rates;
                 true
             }
             "/context" => {
