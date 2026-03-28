@@ -11,6 +11,7 @@ description = "Self-improving software orchestration"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1.89"
+uuid = { version = "1", features = ["v4"] }
 chrono = "0.4.44"
 cpal = "0.17.3"
 crossterm = "0.28"

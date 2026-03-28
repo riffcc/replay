@@ -3079,6 +3079,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transcribe-rs",
+ "uuid",
 ]
 
 [[package]]
