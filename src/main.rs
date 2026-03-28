@@ -847,7 +847,15 @@ fn tool_summary(name: &str, input: &std::collections::HashMap<String, serde_json
             format!("{label} {path}")
         }
         "write" => s("path"),
-        "grep" => s("pattern"),
+        "grep" => {
+            let pattern = s("pattern");
+            let path = s("path");
+            if path.is_empty() || path == "." {
+                pattern
+            } else {
+                format!("{pattern} in {path}")
+            }
+        }
         "glob" => s("pattern"),
         "search" => s("query"),
         "list_directory" => s("path"),
