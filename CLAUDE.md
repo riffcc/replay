@@ -25,7 +25,19 @@ bd dolt push          # Push beads data to remote
 - Prefer **Read** for inspecting code and files instead of shelling out to `sed`, `cat`, or one-off Python readers
 - **Read can be used on files anywhere on the machine**, not just inside the current repo, so prefer it for SmartRead-style inspection of sibling projects such as `~/projects/llm-code-sdk`
 - Use `search`, `grep`, `glob`, and `list_directory` for discovery before falling back to shell exploration
-- Reserve shell commands primarily for builds, tests, git, repo-specific CLIs, and cases where the native tools cannot express the needed operation cleanly
+- Reserve shell commands primarily for builds, tests, git, repo-specific CLIs, and cases where the native tools cannot express the operation cleanly
+
+## Parallelism Dry Run Pattern
+
+When the system does not yet support true native parallel execution, simulate it deliberately:
+
+- Decompose work into independent lanes, agents, or workstreams as if they were running in parallel.
+- Keep a single reasoning thread that tracks all lanes, dependencies, conflicts, and merge points.
+- Use the shared Board / Tasks state to record planned parallel work, claimed sections, and expected interactions.
+- Reconcile the simulated parallel plan against actual file and task state after each step.
+- When the runtime gains true parallel execution, the same decomposition should lift directly into real parallelism.
+
+The goal is to get the design, coordination, and conflict handling right before turning on concurrency.
 
 ## Non-Interactive Shell Commands
 
@@ -42,7 +54,7 @@ rm -f file                  # NOT: rm file
 
 # For recursive operations
 rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
+cp -rf source dest           # NOT: cp -r source dest
 ```
 
 **Other commands that may prompt:**
