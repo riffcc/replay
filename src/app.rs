@@ -813,19 +813,24 @@ impl AppState {
         self.output.clear();
         let width = self.term_width;
 
-        // Collect expanded tool details (cloned to avoid borrow conflict)
-        let tool_details: std::collections::HashMap<usize, ToolCallRecord> = if self.expanded_view {
-            self.tool_calls.iter().filter(|r| r.output.is_some()).map(|r| (r.raw_index, r.clone())).collect()
+        // Build index of which raw_output positions have expanded tool details.
+        // Only collect the index, not the data — we'll borrow when rendering.
+        let expanded_indices: std::collections::HashSet<usize> = if self.expanded_view {
+            self.tool_calls.iter()
+                .filter(|r| r.output.is_some())
+                .map(|r| r.raw_index)
+                .collect()
         } else {
-            std::collections::HashMap::new()
+            std::collections::HashSet::new()
         };
 
-        let raw_entries: Vec<RawEntry> = self.raw_output.iter().cloned().collect();
-        for (i, raw) in raw_entries.iter().enumerate() {
-            // Render the raw entry normally
-            match raw {
+        // Render raw entries. We need to split borrows: iterate raw_output
+        // by index so we can call render_expanded_tool (which borrows self.tool_calls).
+        for i in 0..self.raw_output.len() {
+            match &self.raw_output[i] {
                 RawEntry::Plain(text) => {
-                    for line in wrap_text(text, width) {
+                    let text = text.clone();
+                    for line in wrap_text(&text, width) {
                         self.output.push(OutputLine { content: line, styled: None });
                     }
                 }
@@ -855,9 +860,12 @@ impl AppState {
                 }
             }
 
-            // If expanded view is on and this raw index has a tool record, render details
-            if let Some(record) = tool_details.get(&i) {
-                self.render_expanded_tool(record, width);
+            if expanded_indices.contains(&i) {
+                // Find the tool record for this index and clone just that one
+                if let Some(record) = self.tool_calls.iter().find(|r| r.raw_index == i) {
+                    let record = record.clone();
+                    self.render_expanded_tool(&record, width);
+                }
             }
         }
         self.scroll_offset = 0;
