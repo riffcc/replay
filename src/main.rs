@@ -10,7 +10,6 @@ mod config;
 mod coordinator;
 mod markdown;
 mod mem;
-mod light_tools;
 
 mod models;
 mod display;

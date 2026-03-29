@@ -1955,6 +1955,7 @@ dependencies = [
  "libc",
  "minirust-search",
  "notify",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

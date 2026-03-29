@@ -1333,7 +1333,6 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
         };
 
         Self {
-        Self {
             state,
             input_buffer: String::new(),
             input_cursor: 0,
@@ -1352,6 +1351,7 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
             stick_prev_y: 0,
             voice_insert_start: None,
             voice_last_transcribe: None,
+            available_skills,
         }
     }
 
