@@ -134,7 +134,7 @@ async fn generate_summary(
         ..Default::default()
     };
 
-    let response = client.messages().create(params).await
+    let response = client.messages().create(&params).await
         .context("compaction API call failed")?;
 
     response
