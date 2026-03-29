@@ -21,6 +21,19 @@ pub struct RunMemReport {
     checkpoints: Vec<MemCheckpoint>,
     tool_calls: BTreeMap<String, usize>,
     tool_results: BTreeMap<String, usize>,
+    /// Per-tool latency tracking.
+    tool_timings: Vec<ToolTiming>,
+    /// Start time of the currently executing tool call.
+    pending_tool: Option<(String, Instant)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolTiming {
+    name: String,
+    latency_ms: u64,
+    output_bytes: usize,
+    success: bool,
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +72,18 @@ struct MemReportRecord {
     checkpoints: Vec<MemCheckpoint>,
     tool_calls: BTreeMap<String, usize>,
     tool_results: BTreeMap<String, usize>,
+    tool_timings: Vec<ToolTiming>,
+    /// Per-tool aggregate latency stats.
+    tool_latency_summary: BTreeMap<String, ToolLatencySummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolLatencySummary {
+    count: usize,
+    total_ms: u64,
+    avg_ms: u64,
+    max_ms: u64,
+    min_ms: u64,
 }
 
 impl RunMemReport {
@@ -88,6 +113,8 @@ impl RunMemReport {
             checkpoints: Vec::new(),
             tool_calls: BTreeMap::new(),
             tool_results: BTreeMap::new(),
+            tool_timings: Vec::new(),
+            pending_tool: None,
         };
         report.checkpoint_messages("run_start", messages, None);
         report
@@ -126,6 +153,7 @@ impl RunMemReport {
         match event {
             ToolEvent::ToolCall { name, input } => {
                 *self.tool_calls.entry(name.clone()).or_insert(0) += 1;
+                self.pending_tool = Some((name.clone(), Instant::now()));
                 self.checkpoint(
                     &format!("tool_call:{name}"),
                     summarize_tool_call(name, input),
@@ -138,18 +166,46 @@ impl RunMemReport {
                 ..
             } => {
                 *self.tool_results.entry(name.clone()).or_insert(0) += 1;
+
+                // Compute latency from matching tool_call
+                let latency_ms = self.pending_tool.take()
+                    .filter(|(n, _)| n == name)
+                    .map(|(_, start)| start.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+
+                self.tool_timings.push(ToolTiming {
+                    name: name.clone(),
+                    latency_ms,
+                    output_bytes: output.len(),
+                    success: *success,
+                    note: summarize_tool_call(name, &HashMap::new()),
+                });
+
                 self.checkpoint(
                     &format!("tool_result:{name}"),
-                    Some(format!("success={success} output_bytes={}", output.len())),
+                    Some(format!("success={success} output_bytes={} latency_ms={latency_ms}", output.len())),
                 );
             }
             ToolEvent::Text { .. } | ToolEvent::Usage { .. } => {}
         }
 
-        // Flush to disk every 10 checkpoints so OOM doesn't lose everything
-        if self.checkpoints.len() % 10 == 0 {
-            let _ = self.flush_interim();
+        // Flush to disk every checkpoint so OOM doesn't lose the trail
+        let _ = self.flush_interim();
+    }
+
+    fn compute_latency_summary(&self) -> BTreeMap<String, ToolLatencySummary> {
+        let mut by_tool: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for t in &self.tool_timings {
+            by_tool.entry(t.name.clone()).or_default().push(t.latency_ms);
         }
+        by_tool.into_iter().map(|(name, latencies)| {
+            let count = latencies.len();
+            let total: u64 = latencies.iter().sum();
+            let max = latencies.iter().copied().max().unwrap_or(0);
+            let min = latencies.iter().copied().min().unwrap_or(0);
+            let avg = if count > 0 { total / count as u64 } else { 0 };
+            (name, ToolLatencySummary { count, total_ms: total, avg_ms: avg, max_ms: max, min_ms: min })
+        }).collect()
     }
 
     /// Write an interim report to disk (survives OOM).
@@ -186,6 +242,8 @@ impl RunMemReport {
             checkpoints: self.checkpoints.clone(),
             tool_calls: self.tool_calls.clone(),
             tool_results: self.tool_results.clone(),
+            tool_timings: self.tool_timings.clone(),
+            tool_latency_summary: self.compute_latency_summary(),
         };
 
         let dir = self.project_root.join("synthesis").join("mem-reports");
@@ -262,6 +320,8 @@ impl RunMemReport {
             checkpoints: self.checkpoints.clone(),
             tool_calls: self.tool_calls.clone(),
             tool_results: self.tool_results.clone(),
+            tool_timings: self.tool_timings.clone(),
+            tool_latency_summary: self.compute_latency_summary(),
         };
 
         let dir = self.project_root.join("synthesis").join("mem-reports");
