@@ -438,7 +438,9 @@ async fn main() -> Result<()> {
                                 llm_code_sdk::trace_rss(&format!("callback: before push_tool_call for {}", name));
                                 s.push_tool_call(name, &detail, emoji);
                                 if cb_verbose {
-                                    s.push_output(format!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default()));
+                                    let json = serde_json::to_string_pretty(input).unwrap_or_default();
+                                    let display = if json.len() > 2048 { format!("{}...[{}B]", &json[..2048], json.len()) } else { json };
+                                    s.push_output(format!("  input: {}", display));
                                 }
                             }
                         }
@@ -468,7 +470,8 @@ async fn main() -> Result<()> {
                             }
                             if cb_verbose {
                                 let icon = if *success { "\x1b[32m●\x1b[0m" } else { "\x1b[31m●\x1b[0m" };
-                                s.push_output(format!("  {icon} {name} output: {output}"));
+                                let display = if output.len() > 2048 { format!("{}...[{}B]", &output[..2048], output.len()) } else { output.clone() };
+                                s.push_output(format!("  {icon} {name} output: {display}"));
                             }
                         }
                         llm_code_sdk::tools::ToolEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens } => {
