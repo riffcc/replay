@@ -1278,6 +1278,155 @@ fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+fn composer_suggestions(
+    input: &str,
+    cursor: usize,
+    available_skills: &[String],
+) -> Option<ComposerSuggestions> {
+    if let Some(skill_state) = active_skill_suggestions(input, cursor, available_skills) {
+        return Some(ComposerSuggestions::Skill(skill_state));
+    }
+
+    let slash_matches = slash_suggestions(input);
+    if slash_matches.is_empty() {
+        None
+    } else {
+        Some(ComposerSuggestions::Slash(slash_matches))
+    }
+}
+
+fn apply_first_composer_suggestion(
+    input_buffer: &mut String,
+    input_cursor: &mut usize,
+    available_skills: &[String],
+) {
+    match composer_suggestions(input_buffer, *input_cursor, available_skills) {
+        Some(ComposerSuggestions::Slash(matches)) => {
+            if let Some((cmd, _)) = matches.first() {
+                *input_buffer = cmd.to_string();
+                *input_cursor = input_buffer.len();
+            }
+        }
+        Some(ComposerSuggestions::Skill(skill_state)) => {
+            if let Some(skill) = skill_state.matches.first() {
+                let replacement = format!("${skill}");
+                input_buffer.replace_range(skill_state.start..skill_state.end, &replacement);
+                *input_cursor = skill_state.start + replacement.len();
+            }
+        }
+        None => {}
+    }
+}
+
+fn render_composer_suggestion_lines(suggestions: &ComposerSuggestions) -> Vec<Line<'static>> {
+    match suggestions {
+        ComposerSuggestions::Slash(matches) => matches.iter().map(|(cmd, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {cmd}"), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
+            ])
+        }).collect(),
+        ComposerSuggestions::Skill(skill_state) => skill_state.matches.iter().map(|skill| {
+            Line::from(vec![
+                Span::styled(format!("  ${skill}"), Style::default().fg(Color::Cyan)),
+                Span::styled("  skill", Style::default().fg(Color::DarkGray)),
+            ])
+        }).collect(),
+    }
+}
+
+fn composer_suggestion_height(suggestions: &ComposerSuggestions) -> u16 {
+    match suggestions {
+        ComposerSuggestions::Slash(matches) => matches.len() as u16,
+        ComposerSuggestions::Skill(skill_state) => skill_state.matches.len() as u16,
+    }
+}
+
+
+
+
+const MAX_SKILL_SUGGESTIONS: usize = 8;
+
+enum ComposerSuggestions {
+    Slash(Vec<(&'static str, &'static str)>),
+    Skill(SkillSuggestionState),
+}
+
+struct SkillSuggestionState {
+    start: usize,
+    end: usize,
+    matches: Vec<String>,
+}
+
+fn is_skill_query_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-'
+}
+
+fn active_skill_suggestions(
+    input: &str,
+    cursor: usize,
+    available_skills: &[String],
+) -> Option<SkillSuggestionState> {
+    if input.is_empty() || available_skills.is_empty() {
+        return None;
+    }
+
+    let mut cursor = cursor.min(input.len());
+    while cursor > 0 && !input.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let prev = prev_char_boundary(input, start);
+        let ch = input[prev..start].chars().next().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        start = prev;
+    }
+
+    let mut end = cursor;
+    while end < input.len() {
+        let next = next_char_boundary(input, end);
+        let ch = input[end..next].chars().next().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        end = next;
+    }
+
+    let token = &input[start..end];
+    if !token.starts_with('$') || token.len() <= 1 {
+        return None;
+    }
+
+    let body = &token[1..];
+    if !body.chars().all(is_skill_query_char) {
+        return None;
+    }
+
+    let typed = &input[start + 1..cursor];
+    if typed.is_empty() || !typed.chars().all(is_skill_query_char) {
+        return None;
+    }
+
+    let matches: Vec<String> = available_skills
+        .iter()
+        .filter(|skill| skill.starts_with(typed) && skill.as_str() != body)
+        .take(MAX_SKILL_SUGGESTIONS)
+        .cloned()
+        .collect();
+
+    if matches.is_empty() {
+        None
+    } else {
+        Some(SkillSuggestionState { start, end, matches })
+    }
+}
+
+
+
 fn skill_highlighted_spans(text: &str, available_skills: &[String]) -> Vec<Span<'static>> {
     let references = crate::skills::find_skill_references(text, available_skills);
     if references.is_empty() {
@@ -1377,6 +1526,8 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
                 if state.couch_mode_notify > 0 {
                     state.couch_mode_notify -= 1;
                 }
+                // Unload voice model after 5 minutes idle to reclaim ONNX Runtime memory
+                crate::voice::unload_idle_model(std::time::Duration::from_secs(300));
             }
 
             // Check for text to insert from voice transcription
@@ -1653,12 +1804,11 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
                             self.input_cursor = next_char_boundary(&self.input_buffer, self.input_cursor);
                         }
                         KeyCode::Tab => {
-                            // Complete first matching slash command
-                            let suggestions = slash_suggestions(&self.input_buffer);
-                            if let Some((cmd, _)) = suggestions.first() {
-                                self.input_buffer = cmd.to_string();
-                                self.input_cursor = self.input_buffer.len();
-                            }
+                            apply_first_composer_suggestion(
+                                &mut self.input_buffer,
+                                &mut self.input_cursor,
+                                &self.available_skills,
+                            );
                         }
                         KeyCode::Home => {
                             self.input_cursor = 0;
@@ -1978,14 +2128,21 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
             vec![Line::from(vec![prompt_span])]
         } else {
             let lines: Vec<&str> = self.input_buffer.split('\n').collect();
-            lines.iter().enumerate().map(|(i, text)| {
-                if i == 0 {
-                    Line::from(vec![prompt_span.clone(), Span::raw(*text)])
-                } else {
-                    Line::from(vec![Span::styled("  ", Style::default()), Span::raw(*text)])
-                }
-            }).collect()
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let mut spans = if i == 0 {
+                        vec![prompt_span.clone()]
+                    } else {
+                        vec![Span::styled("  ", Style::default())]
+                    };
+                    spans.extend(skill_highlighted_spans(text, &self.available_skills));
+                    Line::from(spans)
+                })
+                .collect()
         };
+
 
         let input_text = Paragraph::new(input_lines)
             .style(Style::default().bg(Color::Rgb(30, 30, 30)))
@@ -2006,16 +2163,15 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
         let cursor_y = input_area.y + 1 + visual_line as u16;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 
-        // ── Slash command suggestions ──
-        let suggestions = slash_suggestions(&self.input_buffer);
-        if !suggestions.is_empty() {
-            let suggestion_lines: Vec<Line> = suggestions.iter().map(|(cmd, desc)| {
-                Line::from(vec![
-                    Span::styled(format!("  {cmd}"), Style::default().fg(Color::Cyan)),
-                    Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray)),
-                ])
-            }).collect();
-            let suggestion_height = suggestion_lines.len() as u16;
+        // ── Composer suggestions ──
+        let suggestions = composer_suggestions(
+            &self.input_buffer,
+            self.input_cursor,
+            &self.available_skills,
+        );
+        if let Some(suggestions) = suggestions {
+            let suggestion_lines = render_composer_suggestion_lines(&suggestions);
+            let suggestion_height = composer_suggestion_height(&suggestions);
             // Position above the input area
             let suggestion_y = input_area.y.saturating_sub(suggestion_height);
             let suggestion_area = Rect::new(
@@ -2521,16 +2677,16 @@ impl App {
         }
 
         // Handle Select button for voice input.
+        // ONLY in couch mode — prevents accidental ONNX model loading.
         // - Hold: push-to-talk, release stops recording.
         // - Short tap (<300ms) + release: toggle mode, stays recording until next tap.
         const SHORT_TAP_MS: u128 = 300;
 
-        if select_pressed {
+        let couch = self.state.lock().unwrap().couch_mode;
+        if select_pressed && couch {
             if self.voice_capture.is_some() && self.voice_toggled {
-                // In toggle mode — tap stops recording
                 self.stop_voice_recording();
             } else if self.voice_capture.is_none() {
-                // Start recording, remember when we pressed
                 self.voice_press_time = Some(std::time::Instant::now());
                 self.voice_toggled = false;
                 self.start_voice_recording();

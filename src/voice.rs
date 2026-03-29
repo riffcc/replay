@@ -188,14 +188,29 @@ pub fn encode_wav(samples: &[f32]) -> Result<Vec<u8>, String> {
 
 // ── Local Parakeet transcription ──
 
-/// Global transcriber instance — model stays loaded across calls.
+/// Global transcriber instance — loads on demand, unloads when idle.
 static TRANSCRIBER: LazyLock<Mutex<LocalTranscriber>> =
     LazyLock::new(|| Mutex::new(LocalTranscriber::default()));
+
+/// Unload the voice model if it hasn't been used recently.
+/// Call this periodically (e.g. every tick) to reclaim ONNX Runtime memory.
+pub fn unload_idle_model(idle_timeout: std::time::Duration) {
+    if let Ok(mut t) = TRANSCRIBER.try_lock() {
+        if let Some(last) = t.last_used {
+            if last.elapsed() > idle_timeout && t.engine.is_some() {
+                tracing::info!("Unloading voice model after {:?} idle", last.elapsed());
+                t.engine = None;
+                t.loaded_model_dir = None;
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct LocalTranscriber {
     loaded_model_dir: Option<PathBuf>,
     engine: Option<ParakeetEngine>,
+    last_used: Option<std::time::Instant>,
 }
 
 impl LocalTranscriber {
@@ -205,6 +220,7 @@ impl LocalTranscriber {
         }
 
         self.ensure_model_loaded(model_dir)?;
+        self.last_used = Some(std::time::Instant::now());
 
         let result = match self.engine.as_mut() {
             Some(engine) => {
