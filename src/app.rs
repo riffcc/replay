@@ -4,7 +4,9 @@
 //! between output and input areas.
 
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -670,9 +672,12 @@ impl AppState {
             let reason = meta.and_then(|m| m.get("reason")).and_then(|v| v.as_str()).unwrap_or("");
             let operation = meta.and_then(|m| m.get("operation")).and_then(|v| v.as_str()).unwrap_or("write");
 
-            // Operation label: human words, no underscores
+            // Operation label: human words
+            let has_removes = record.diffstat.is_some_and(|(_, r)| r > 0);
             let op_word = match operation {
+                "write" if has_removes => "edit",
                 "write" => "create",
+                "overwrite" if has_removes => "edit",
                 "overwrite" => "overwrite",
                 "replace" | "replace_function" | "replace_symbol" | "replace_lines" => "edit",
                 "delete" => "delete",
@@ -1210,6 +1215,7 @@ pub enum AppEvent {
 /// The TUI application.
 pub struct App {
     state: Arc<Mutex<AppState>>,
+    available_skills: Vec<String>,
     input_buffer: String,
     input_cursor: usize,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -1272,6 +1278,37 @@ fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+fn skill_highlighted_spans(text: &str, available_skills: &[String]) -> Vec<Span<'static>> {
+    let references = crate::skills::find_skill_references(text, available_skills);
+    if references.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+
+    for reference in references {
+        if reference.start > cursor {
+            spans.push(Span::raw(text[cursor..reference.start].to_string()));
+        }
+        spans.push(Span::styled(
+            text[reference.start..reference.end].to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        cursor = reference.end;
+    }
+
+    if cursor < text.len() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+
+    spans
+}
+
 // Throbber animation chars
 const THROBBER_FRAMES: [[&str; 4]; 8] = [
     ["▇", "▅", "▃", "▁"],
@@ -1285,7 +1322,17 @@ const THROBBER_FRAMES: [[&str; 4]; 8] = [
 ];
 
 impl App {
-    pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+        let available_skills = {
+            let project_path = state.lock().unwrap().project_path.clone();
+            if project_path.is_empty() {
+                Vec::new()
+            } else {
+                crate::skills::discover_skill_names(Path::new(&project_path))
+            }
+        };
+
+        Self {
         Self {
             state,
             input_buffer: String::new(),
