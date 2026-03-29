@@ -2677,13 +2677,11 @@ impl App {
         }
 
         // Handle Select button for voice input.
-        // ONLY in couch mode — prevents accidental ONNX model loading.
         // - Hold: push-to-talk, release stops recording.
         // - Short tap (<300ms) + release: toggle mode, stays recording until next tap.
         const SHORT_TAP_MS: u128 = 300;
 
-        let couch = self.state.lock().unwrap().couch_mode;
-        if select_pressed && couch {
+        if select_pressed {
             if self.voice_capture.is_some() && self.voice_toggled {
                 self.stop_voice_recording();
             } else if self.voice_capture.is_none() {
