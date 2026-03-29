@@ -605,6 +605,7 @@ impl AppState {
 
     /// Push a tool call line and record it for later update / expanded view.
     pub fn push_tool_call(&mut self, name: &str, detail: &str, emoji: &str) {
+        llm_code_sdk::trace_rss(&format!("push_tool_call enter: {} raw={} tools={}", name, self.raw_output.len(), self.tool_calls.len()));
         let line = if detail.is_empty() {
             format!("{emoji} {name}")
         } else {
@@ -612,9 +613,11 @@ impl AppState {
         };
         let raw_index = self.raw_output.len();
         self.raw_output.push(RawEntry::Plain(line.clone()));
+        llm_code_sdk::trace_rss("push_tool_call: after raw_output push");
         for wrapped in wrap_text(&line, self.term_width) {
             self.output.push(OutputLine { content: wrapped, styled: None });
         }
+        llm_code_sdk::trace_rss("push_tool_call: after output push");
         self.tool_calls.push(ToolCallRecord {
             name: name.to_string(),
             detail: detail.to_string(),
@@ -625,6 +628,7 @@ impl AppState {
             metadata: None,
         });
         self.scroll_offset = 0;
+        llm_code_sdk::trace_rss("push_tool_call exit");
     }
 
     /// Update the most recent matching tool call with result metadata.

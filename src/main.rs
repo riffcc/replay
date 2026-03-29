@@ -432,8 +432,10 @@ async fn main() -> Result<()> {
                             if name == "survey" {
                                 // The survey UI will appear via pending_survey in AppState
                             } else {
+                                llm_code_sdk::trace_rss(&format!("callback: before tool_summary for {}", name));
                                 let detail = tool_summary(name, input);
                                 let emoji = tool_emoji(name);
+                                llm_code_sdk::trace_rss(&format!("callback: before push_tool_call for {}", name));
                                 s.push_tool_call(name, &detail, emoji);
                                 if cb_verbose {
                                     s.push_output(format!("  input: {}", serde_json::to_string_pretty(input).unwrap_or_default()));
@@ -851,6 +853,7 @@ fn tool_summary(name: &str, input: &std::collections::HashMap<String, serde_json
         "write" => s("path"),
         "grep" => {
             let pattern = s("pattern");
+            let pattern = if pattern.len() > 80 { format!("{}...", &pattern[..77]) } else { pattern };
             let path = s("path");
             if path.is_empty() || path == "." {
                 pattern
@@ -858,8 +861,14 @@ fn tool_summary(name: &str, input: &std::collections::HashMap<String, serde_json
                 format!("{pattern} in {path}")
             }
         }
-        "glob" => s("pattern"),
-        "search" => s("query"),
+        "glob" => {
+            let p = s("pattern");
+            if p.len() > 80 { format!("{}...", &p[..77]) } else { p }
+        }
+        "search" => {
+            let q = s("query");
+            if q.len() > 80 { format!("{}...", &q[..77]) } else { q }
+        }
         "list_directory" => s("path"),
         "tasks" => {
             let op = s("operation");
