@@ -382,6 +382,8 @@ pub struct AppState {
     pub queued_messages: Vec<String>,
     /// Transient status message shown in the input border.
     pub status_message: Option<String>,
+    /// Dirty flag — rewrap on next render tick instead of eagerly.
+    pub needs_rewrap: bool,
     /// Throbber frame for animation.
     pub throbber_frame: u8,
     /// Throbber state: 0=idle, 1=thinking, 2=tool
@@ -462,6 +464,7 @@ impl AppState {
             agent_active: false,
             queued_messages: Vec::new(),
             status_message: None,
+            needs_rewrap: false,
             throbber_frame: 0,
             throbber_state: 0,
             total_input_tokens: 0,
@@ -711,8 +714,13 @@ impl AppState {
 
             let new_line = parts.join("\n");
             let raw_idx = record.raw_index;
-            self.raw_output[raw_idx] = RawEntry::Ansi(new_line);
-            self.rewrap(self.term_width);
+            self.raw_output[raw_idx] = RawEntry::Ansi(new_line.clone());
+
+            // Re-render just this entry instead of rewrapping everything.
+            // Find the output lines that correspond to this raw_index and replace them.
+            // Since we can't easily map raw_index → output line range, mark dirty
+            // and let the next render frame handle it.
+            self.needs_rewrap = true;
         }
     }
 
@@ -1527,6 +1535,11 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
                     state.throbber_frame = (state.throbber_frame + 1) % 8;
                 }
                 state.tick_tokens();
+                if state.needs_rewrap {
+                    state.needs_rewrap = false;
+                    let w = state.term_width;
+                    state.rewrap(w);
+                }
                 if state.couch_mode_notify > 0 {
                     state.couch_mode_notify -= 1;
                 }
@@ -1565,7 +1578,8 @@ pub fn new(state: Arc<Mutex<AppState>>, event_tx: mpsc::UnboundedSender<AppEvent
 
                 if let Event::Resize(w, _) = ev {
                     let mut state = self.state.lock().unwrap();
-                    state.rewrap(w as usize);
+                    state.term_width = w as usize;
+                    state.needs_rewrap = true;
                     continue;
                 }
 

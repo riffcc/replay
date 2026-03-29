@@ -6,6 +6,18 @@ use std::path::Path;
 use llm_code_sdk::SkillRegistry;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSkill {
+    pub name: String,
+    pub description: String,
+}
+
+impl AsRef<str> for DiscoveredSkill {
+    fn as_ref(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillReference {
     pub name: String,
     pub start: usize,
@@ -17,14 +29,14 @@ fn is_skill_start_char(c: char) -> bool {
 }
 
 fn is_skill_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    c.is_ascii_alphanumeric() || c == '-'
 }
 
 fn has_wordish_prefix(input: &str, idx: usize) -> bool {
     input[..idx]
         .chars()
         .next_back()
-        .map(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        .map(|c| c.is_ascii_alphanumeric() || c == '-')
         .unwrap_or(false)
 }
 
@@ -39,22 +51,35 @@ pub fn discover_registry(project_root: &Path) -> SkillRegistry {
     registry
 }
 
-pub fn discover_skill_names(project_root: &Path) -> Vec<String> {
-    let mut names: Vec<String> = discover_registry(project_root)
+pub fn discover_skills(project_root: &Path) -> Vec<DiscoveredSkill> {
+    let registry = discover_registry(project_root);
+    let mut skills: Vec<DiscoveredSkill> = registry
         .list()
         .into_iter()
-        .map(str::to_string)
+        .filter_map(|name| {
+            registry.get(name).map(|skill| DiscoveredSkill {
+                name: skill.meta.name.clone(),
+                description: skill.meta.description.clone(),
+            })
+        })
         .collect();
-    names.sort();
-    names
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
 }
 
-pub fn find_skill_references(input: &str, available_skills: &[String]) -> Vec<SkillReference> {
+pub fn discover_skill_names(project_root: &Path) -> Vec<String> {
+    discover_skills(project_root)
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect()
+}
+
+pub fn find_skill_references<T: AsRef<str>>(input: &str, available_skills: &[T]) -> Vec<SkillReference> {
     if input.is_empty() || available_skills.is_empty() {
         return Vec::new();
     }
 
-    let known: HashSet<&str> = available_skills.iter().map(String::as_str).collect();
+    let known: HashSet<&str> = available_skills.iter().map(|skill| skill.as_ref()).collect();
     let mut refs = Vec::new();
     let mut i = 0;
 
@@ -110,7 +135,7 @@ pub fn find_skill_references(input: &str, available_skills: &[String]) -> Vec<Sk
     refs
 }
 
-pub fn extract_skill_references(input: &str, available_skills: &[String]) -> Vec<String> {
+pub fn extract_skill_references<T: AsRef<str>>(input: &str, available_skills: &[T]) -> Vec<String> {
     let mut names = Vec::new();
     for reference in find_skill_references(input, available_skills) {
         if !names.iter().any(|name| name == &reference.name) {
@@ -120,7 +145,7 @@ pub fn extract_skill_references(input: &str, available_skills: &[String]) -> Vec
     names
 }
 
-pub fn strip_skill_references(input: &str, available_skills: &[String]) -> String {
+pub fn strip_skill_references<T: AsRef<str>>(input: &str, available_skills: &[T]) -> String {
     let references = find_skill_references(input, available_skills);
     if references.is_empty() {
         return input.to_string();
