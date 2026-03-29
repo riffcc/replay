@@ -37,6 +37,22 @@ struct ToolTiming {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct JemallocStats {
+    /// Total bytes allocated by the application.
+    allocated_bytes: u64,
+    /// Total bytes in active pages (mapped, potentially dirty).
+    active_bytes: u64,
+    /// Total bytes in metadata.
+    metadata_bytes: u64,
+    /// Total bytes mapped by the allocator.
+    mapped_bytes: u64,
+    /// Total bytes retained (not released to OS).
+    retained_bytes: u64,
+    /// resident bytes from jemalloc's perspective
+    resident_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct MemCheckpoint {
     label: String,
     elapsed_ms: u64,
@@ -45,6 +61,7 @@ struct MemCheckpoint {
     history_len: Option<usize>,
     message_chars: Option<usize>,
     note: Option<String>,
+    jemalloc: Option<JemallocStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +146,7 @@ impl RunMemReport {
             history_len: None,
             message_chars: None,
             note: note.map(|n| truncate_chars(&n, 240)),
+            jemalloc: jemalloc_stats(),
         });
     }
 
@@ -146,6 +164,7 @@ impl RunMemReport {
             history_len: Some(messages.len()),
             message_chars: Some(total_message_chars(messages)),
             note: note.map(|n| truncate_chars(&n, 240)),
+            jemalloc: jemalloc_stats(),
         });
     }
 
@@ -369,6 +388,22 @@ fn rss_delta_kb(initial: Option<u64>, current: Option<u64>) -> Option<i64> {
         (Some(a), Some(b)) => Some(b as i64 - a as i64),
         _ => None,
     }
+}
+
+fn jemalloc_stats() -> Option<JemallocStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    // Advance the epoch to refresh stats
+    epoch::advance().ok()?;
+
+    Some(JemallocStats {
+        allocated_bytes: stats::allocated::read().ok()? as u64,
+        active_bytes: stats::active::read().ok()? as u64,
+        metadata_bytes: stats::metadata::read().ok()? as u64,
+        mapped_bytes: stats::mapped::read().ok()? as u64,
+        retained_bytes: stats::retained::read().ok()? as u64,
+        resident_bytes: stats::resident::read().ok()? as u64,
+    })
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {

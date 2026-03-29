@@ -32,6 +32,8 @@ serde_json = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tar = "0.4"
 termimad = "0.34.1"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
