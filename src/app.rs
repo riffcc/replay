@@ -1505,7 +1505,16 @@ impl App {
                             }
                         }
                         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            // Shift-enter: insert newline (terminals that support it)
+                            // Shift-enter: insert newline (terminals that support kitty protocol)
+                            self.input_buffer.insert(self.input_cursor, '\n');
+                            self.input_cursor += 1;
+                        }
+                        // Many terminals send Shift+Enter as Char('j') with SHIFT
+                        // (Enter = ^J = 0x0A, Shift adds the modifier but the key stays 'j')
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::SHIFT)
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
                             self.input_buffer.insert(self.input_cursor, '\n');
                             self.input_cursor += 1;
                         }
