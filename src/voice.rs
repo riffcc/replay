@@ -11,10 +11,10 @@ use std::sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use flate2::read::GzDecoder;
 use tar::Archive;
-use transcribe_rs::TranscriptionEngine;
-use transcribe_rs::engines::parakeet::{
-    ParakeetEngine, ParakeetInferenceParams, ParakeetModelParams, TimestampGranularity,
-};
+use transcribe_rs::SpeechModel;
+use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity};
+use transcribe_rs::onnx::Quantization;
+use transcribe_rs::TranscribeOptions;
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
 const LOCAL_VOICE_MODEL_DIRNAME: &str = "parakeet-tdt-0.6b-v3-int8";
@@ -209,7 +209,7 @@ pub fn unload_idle_model(idle_timeout: std::time::Duration) {
 #[derive(Default)]
 struct LocalTranscriber {
     loaded_model_dir: Option<PathBuf>,
-    engine: Option<ParakeetEngine>,
+    engine: Option<ParakeetModel>,
     last_used: Option<std::time::Instant>,
 }
 
@@ -224,12 +224,9 @@ impl LocalTranscriber {
 
         let result = match self.engine.as_mut() {
             Some(engine) => {
-                let params = ParakeetInferenceParams {
-                    timestamp_granularity: TimestampGranularity::Segment,
-                    ..Default::default()
-                };
+                let opts = TranscribeOptions::default();
                 engine
-                    .transcribe_samples(samples, Some(params))
+                    .transcribe(&samples, &opts)
                     .map_err(|err| format!("Parakeet transcription failed: {err}"))?
                     .text
             }
@@ -244,9 +241,7 @@ impl LocalTranscriber {
             return Ok(());
         }
 
-        let mut engine = ParakeetEngine::new();
-        engine
-            .load_model_with_params(model_dir, ParakeetModelParams::int8())
+        let engine = ParakeetModel::load(model_dir, &Quantization::Int8)
             .map_err(|err| format!("failed to load Parakeet model: {err}"))?;
         self.engine = Some(engine);
         self.loaded_model_dir = Some(model_dir.to_path_buf());
