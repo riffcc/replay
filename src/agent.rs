@@ -8,8 +8,9 @@ use llm_code_sdk::{
 };
 use llm_code_sdk::tools::{
     BashTool, GrepTool, SearchTool, SurveyOption, SurveyRequest,
-    SurveyTool, TasksTool, ToolEvent, ToolEventCallback,
+    SurveyResponse, SurveyTool, TasksTool, ToolEvent, ToolEventCallback,
 };
+
 use llm_code_sdk::tools::smart::{SmartReadTool, SmartWriteTool};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -626,6 +627,20 @@ fn build_system_prompt(
         }
     }
 
+    // Tool usage guidance — transitive prompting, not negative prompting
+    parts.push(
+"## Tool usage
+
+When inspecting code, use read — it supports multi-range reads, symbol extraction, \
+AST views, and layered analysis. When searching for patterns, use grep — it groups \
+results by structural unit with call graph context by default. When finding files, \
+use glob. When running builds, tests, git, or repo CLIs, use bash.
+
+STRONGLY prefer native tools over bash for file inspection (not cat, head, tail, sed -n). \
+STRONGLY prefer native tools over bash for search (not grep, rg, find). \
+The native tools are faster, structured, and memory-efficient. \
+Bash is for executing commands that have side effects.".to_string());
+
     let agents_md = project_root.join("AGENTS.md");
     if agents_md.exists() {
         if let Ok(content) = std::fs::read_to_string(&agents_md) {
@@ -687,6 +702,14 @@ pub async fn execute(
     }
     let client = builder.build().context("failed to create LLM client")?;
 
+    history.push(MessageParam::user(instruction));
+    let mut mem_report = crate::mem::RunMemReport::start(
+        project_root,
+        model.model_id.to_string(),
+        instruction.chars().count(),
+        history,
+    );
+
     let skill_registry = Arc::new(RwLock::new(SkillRegistry::new()));
     {
         let mut reg = skill_registry.write().unwrap();
@@ -696,6 +719,8 @@ pub async fn execute(
         let local_skills = project_root.join(".replay").join("skills");
         reg.discover(&local_skills);
     }
+    mem_report.checkpoint_messages("after_skill_discovery", history, None);
+
     let (tools, process_registry) = create_tools(
         project_root,
         &skill_registry,
@@ -704,19 +729,35 @@ pub async fn execute(
         sandbox_mode,
         session_permissions,
     ).await;
+    mem_report.checkpoint_messages(
+        "after_tool_setup",
+        history,
+        Some(format!("tool_count={}", tools.len())),
+    );
+
+    let mem_report = Arc::new(std::sync::Mutex::new(mem_report));
+    let on_event_outer = on_event.clone();
+    let mem_report_events = Arc::clone(&mem_report);
+    let combined_on_event: ToolEventCallback = Arc::new(move |event| {
+        if let Ok(mut report) = mem_report_events.lock() {
+            report.record_tool_event(&event);
+        }
+        on_event_outer(event);
+    });
 
     let config = ToolRunnerConfig {
         max_iterations: Some(50),
         verbose: false,
-        on_event: Some(on_event),
+        on_event: Some(combined_on_event),
         cancel: Some(cancel),
         ..Default::default()
     };
 
     let runner = ToolRunner::with_config(client, tools, config);
     let system = build_system_prompt(project_root, &skill_registry, sandbox_mode).map(SystemPrompt::Text);
-
-    history.push(MessageParam::user(instruction));
+    if let Ok(mut report) = mem_report.lock() {
+        report.checkpoint_messages("after_system_prompt", history, None);
+    }
 
     let params = MessageCreateParams {
         model: model.model_id.into(),
@@ -726,19 +767,39 @@ pub async fn execute(
         reasoning_effort: if model.supports_effort { reasoning_effort } else { None },
         ..Default::default()
     };
+    if let Ok(mut report) = mem_report.lock() {
+        report.checkpoint_messages(
+            "before_runner_run",
+            &params.messages,
+            Some(format!("message_count={}", params.messages.len())),
+        );
+    }
 
-    let mem_report = crate::mem::RunMemReport::start(project_root, history.len(), &params.messages);
+    let response = match runner.run(params).await {
+        Ok(response) => response,
+        Err(err) => {
+            if let Ok(mut report) = mem_report.lock() {
+                let _ = report.write_error(history, &err.to_string());
+            }
+            return Err(err).context("agent run failed");
+        }
+    };
+    if let Ok(mut report) = mem_report.lock() {
+        report.checkpoint_messages("after_runner_run", history, None);
+    }
 
-    let response = runner.run(params).await.context("agent run failed")?;
     let text = response
         .text()
         .ok_or_else(|| anyhow::anyhow!("agent produced no text response"))?
         .to_string();
 
     history.push(MessageParam::assistant(&text));
-    let _ = mem_report.finish(history.len(), history, &text);
+    if let Ok(mut report) = mem_report.lock() {
+        let _ = report.write_success(history, &text);
+    }
     Ok((text, process_registry))
 }
+
 
 pub async fn solve(issue: &Issue, project_root: &Path, model: &ModelDef) -> Result<String> {
     let api_key = crate::models::resolve_auth(model)
@@ -754,8 +815,9 @@ pub async fn solve(issue: &Issue, project_root: &Path, model: &ModelDef) -> Resu
 
     let skill_registry = Arc::new(RwLock::new(SkillRegistry::new()));
     let noop_survey: llm_code_sdk::tools::SurveyCallback = Arc::new(|_| {
-        llm_code_sdk::tools::SurveyResponse { selected: vec![] }
+        SurveyResponse { selected: vec![] }
     });
+
     let permission_callbacks = PermissionCallbacks {
         bash: noop_survey.clone(),
         write: noop_survey,
